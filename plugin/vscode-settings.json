@@ -1,0 +1,5 @@
+{
+  "github.copilot.chat.proxy.url": "http://localhost:8787/v1",
+  "extensions.autoUpdate": "off",
+  "extensions.autoCheckUpdates": false
+}
