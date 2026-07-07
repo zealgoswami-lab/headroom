@@ -13,6 +13,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -894,6 +895,51 @@ def has_oauth_auth() -> bool:
     """Return True when existing Copilot auth can be reused."""
 
     return resolve_client_bearer_token() is not None
+
+
+# Hostnames the patched VS Code Copilot Chat extension may send via
+# ``X-Original-Host``. Narrower than ``_is_public_copilot_api_host`` to block SSRF.
+COPILOT_PROXY_ALLOWED_HOSTS: frozenset[str] = frozenset(
+    {
+        "api.githubcopilot.com",
+        "api.individual.githubcopilot.com",
+        "api.business.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+        "api-model-lab.githubcopilot.com",
+    }
+)
+
+
+def _proxy_header_value(headers: Mapping[str, str], name: str) -> str | None:
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
+
+
+def resolve_copilot_proxy_upstream_base(headers: Mapping[str, str]) -> str | None:
+    """Return a trusted Copilot API base URL from proxy control headers.
+
+    The patched Copilot Chat VSIX sends ``X-Original-Host`` (for example
+    ``api.individual.githubcopilot.com``) so Headroom can route model
+    discovery and chat traffic to the correct plan-specific host without
+    requiring ``OPENAI_TARGET_API_URL``. ``x-headroom-base-url`` wins when
+    both are present.
+    """
+    custom_base = _proxy_header_value(headers, "x-headroom-base-url")
+    if custom_base:
+        return custom_base.strip().rstrip("/")
+
+    original_host = (_proxy_header_value(headers, "x-original-host") or "").strip()
+    if original_host in COPILOT_PROXY_ALLOWED_HOSTS:
+        return f"https://{original_host}"
+    if original_host:
+        logging.getLogger("headroom.proxy.routes").warning(
+            "Rejected X-Original-Host %r: not in Copilot allowlist",
+            original_host,
+        )
+    return None
 
 
 def is_copilot_api_url(url: str | None) -> bool:

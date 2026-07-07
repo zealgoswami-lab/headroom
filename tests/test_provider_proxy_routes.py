@@ -1058,6 +1058,53 @@ def test_v1_models_routes_claude_code_gateway_discovery_to_anthropic() -> None:
     ]
 
 
+def test_v1_models_routes_copilot_chat_via_x_original_host() -> None:
+    """Patched Copilot Chat sends X-Original-Host for per-plan API hosts.
+
+    Without this routing, model discovery hits api.openai.com and Copilot Chat
+    shows "Language model unavailable".
+    """
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            list_response = client.get(
+                "/v1/models",
+                headers={
+                    "authorization": "Bearer tid_test",
+                    "x-original-host": "api.individual.githubcopilot.com",
+                    "user-agent": "GitHubCopilotChat/0.56.0",
+                },
+            )
+            get_response = client.get(
+                "/v1/models/gpt-4.1",
+                headers={
+                    "authorization": "Bearer tid_test",
+                    "x-original-host": "api.individual.githubcopilot.com",
+                    "user-agent": "GitHubCopilotChat/0.56.0",
+                },
+            )
+
+    assert list_response.status_code == 200
+    assert get_response.status_code == 200
+    assert list_response.json() == {
+        "base_url": "https://api.individual.githubcopilot.com",
+        "provider": "openai",
+    }
+    assert get_response.json() == {
+        "base_url": "https://api.individual.githubcopilot.com",
+        "provider": "openai",
+    }
+    assert calls == [
+        ("/v1/models", "https://api.individual.githubcopilot.com", "openai"),
+        ("/v1/models/gpt-4.1", "https://api.individual.githubcopilot.com", "openai"),
+    ]
+
+
 def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
     class FakeAsyncClient:
         def __init__(self) -> None:

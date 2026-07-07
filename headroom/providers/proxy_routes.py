@@ -11,23 +11,10 @@ from urllib.parse import quote
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
+from headroom.copilot_auth import resolve_copilot_proxy_upstream_base
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
-
-# Allowlist of GitHub Copilot LLM hostnames that the patched VS Code extension
-# may forward via X-Original-Host. Only these hosts are trusted; any other value
-# is rejected to prevent SSRF attacks (localhost, link-local metadata addresses,
-# internal service names, or arbitrary external hosts).
-_COPILOT_ALLOWED_HOSTS: frozenset[str] = frozenset(
-    {
-        "api.githubcopilot.com",
-        "api.individual.githubcopilot.com",
-        "api.business.githubcopilot.com",
-        "api.enterprise.githubcopilot.com",
-        "api-model-lab.githubcopilot.com",
-    }
-)
 
 
 def _api_target(proxy: Any, provider_name: str) -> str:
@@ -63,6 +50,15 @@ def _vertex_target_for_location(proxy: Any, location: str) -> str:
     return f"https://{location}-aiplatform.googleapis.com"
 
 
+def _select_models_base_url(proxy: Any, headers: dict[str, str]) -> tuple[str, str]:
+    """Resolve upstream base URL and provider for OpenAI-style model metadata."""
+    copilot_base = resolve_copilot_proxy_upstream_base(headers)
+    if copilot_base:
+        return copilot_base, "openai"
+    provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+    return _api_target(proxy, provider_name), provider_name
+
+
 def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
     # Codex CLI subscription mode hits a wide surface under
     # `/backend-api/*` (rate-limit polling, agent identity, JWT
@@ -74,6 +70,9 @@ def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
     _, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
     if is_chatgpt_auth:
         return "https://chatgpt.com"
+    copilot_base = resolve_copilot_proxy_upstream_base(headers)
+    if copilot_base:
+        return copilot_base
     if headers.get("x-goog-api-key"):
         return _api_target(proxy, "gemini")
     if headers.get("api-key"):
@@ -821,10 +820,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if chatgpt_response is not None:
             return chatgpt_response
 
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        headers = dict(request.headers.items())
+        base_url, provider_name = _select_models_base_url(proxy, headers)
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, provider_name),
+            base_url,
             "models",
             provider_name,
         )
@@ -839,10 +839,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if chatgpt_response is not None:
             return chatgpt_response
 
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        headers = dict(request.headers.items())
+        base_url, provider_name = _select_models_base_url(proxy, headers)
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, provider_name),
+            base_url,
             "models",
             provider_name,
         )
@@ -1007,15 +1008,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
     async def passthrough(request: Request, path: str):
-        custom_base = request.headers.get("x-headroom-base-url")
-        if not custom_base:
-            original_host = request.headers.get("x-original-host", "")
-            if original_host in _COPILOT_ALLOWED_HOSTS:
-                custom_base = f"https://{original_host}"
-            elif original_host:
-                logger.warning(
-                    "Rejected X-Original-Host %r: not in Copilot allowlist", original_host
-                )
+        custom_base = resolve_copilot_proxy_upstream_base(dict(request.headers.items()))
         if custom_base:
             return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
 

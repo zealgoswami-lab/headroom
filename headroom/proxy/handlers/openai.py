@@ -44,7 +44,11 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
-from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
+from headroom.copilot_auth import (
+    apply_copilot_api_auth,
+    build_copilot_upstream_url,
+    resolve_copilot_proxy_upstream_base,
+)
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
@@ -111,6 +115,10 @@ def _resolve_openai_handler_path(
 
 
 def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+    copilot_base = resolve_copilot_proxy_upstream_base(request_headers)
+    if copilot_base:
+        return copilot_base
+
     raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
     if raw_base_url is None:
         return None
@@ -787,12 +795,16 @@ class OpenAIHandlerMixin:
     def _resolve_openai_upstream(self, request: Request) -> str:
         """Return the OpenAI upstream base URL for ``request``.
 
-        Honors the ``x-headroom-base-url`` request header so OpenAI-compatible
-        gateways (LiteLLM, CPA, self-hosted vLLM, Azure OpenAI) route through
-        the dedicated ``/v1/chat/completions`` and ``/v1/responses`` handlers,
-        not just the generic passthrough route that already honors it. Falls
+        Honors ``X-Original-Host`` from the patched Copilot Chat VSIX and the
+        ``x-headroom-base-url`` request header so OpenAI-compatible gateways
+        (LiteLLM, CPA, self-hosted vLLM, Azure OpenAI) route through the
+        dedicated ``/v1/chat/completions`` and ``/v1/responses`` handlers, not
+        just the generic passthrough route that already honors them. Falls
         back to the configured ``OPENAI_API_URL`` (``OPENAI_TARGET_API_URL``).
         """
+        copilot_base = resolve_copilot_proxy_upstream_base(dict(request.headers.items()))
+        if copilot_base:
+            return copilot_base
         custom = request.headers.get("x-headroom-base-url", "").strip()
         return custom or self.OPENAI_API_URL
 
