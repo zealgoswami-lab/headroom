@@ -918,6 +918,42 @@ def _proxy_header_value(headers: Mapping[str, str], name: str) -> str | None:
     return None
 
 
+def _copilot_proxy_host_from_header(value: str) -> str:
+    """Normalize an ``X-Original-Host`` value to a lowercase hostname."""
+
+    return value.strip().lower().split(":", 1)[0]
+
+
+def _explicit_copilot_api_override() -> str | None:
+    """Return a configured Copilot API base when the operator pinned enterprise routing."""
+
+    if os.environ.get("GITHUB_COPILOT_API_URL", "").strip():
+        return _configured_api_url()
+    if _configured_enterprise_domain():
+        return _configured_api_url()
+    return None
+
+
+def _is_copilot_proxy_allowed_host(host: str) -> bool:
+    """Return True when ``X-Original-Host`` may route to a Copilot API upstream.
+
+    Narrower than ``is_copilot_api_url`` for the default public hosts: only the
+    plan-specific hostnames the patched VS Code extension sends are accepted,
+    plus GitHub Enterprise Copilot API patterns and any host explicitly
+    configured via ``GITHUB_COPILOT_API_URL`` / ``GITHUB_COPILOT_ENTERPRISE_DOMAIN``.
+    """
+
+    hostname = _copilot_proxy_host_from_header(host)
+    if not hostname:
+        return False
+    if hostname in COPILOT_PROXY_ALLOWED_HOSTS:
+        return True
+    if _is_ghe_copilot_api_host(hostname):
+        return True
+    configured_host = (urlparse(_configured_api_url()).hostname or "").lower()
+    return bool(configured_host and hostname == configured_host)
+
+
 def resolve_copilot_proxy_upstream_base(headers: Mapping[str, str]) -> str | None:
     """Return a trusted Copilot API base URL from proxy control headers.
 
@@ -926,20 +962,26 @@ def resolve_copilot_proxy_upstream_base(headers: Mapping[str, str]) -> str | Non
     discovery and chat traffic to the correct plan-specific host without
     requiring ``OPENAI_TARGET_API_URL``. ``x-headroom-base-url`` wins when
     both are present.
+
+    When enterprise routing is configured via ``GITHUB_COPILOT_API_URL`` or
+    ``GITHUB_COPILOT_ENTERPRISE_DOMAIN``, that base is used as a fallback when
+    the header is absent (for example before the extension attaches it).
     """
     custom_base = _proxy_header_value(headers, "x-headroom-base-url")
     if custom_base:
         return custom_base.strip().rstrip("/")
 
     original_host = (_proxy_header_value(headers, "x-original-host") or "").strip()
-    if original_host in COPILOT_PROXY_ALLOWED_HOSTS:
-        return f"https://{original_host}"
     if original_host:
+        if _is_copilot_proxy_allowed_host(original_host):
+            return f"https://{_copilot_proxy_host_from_header(original_host)}"
         logging.getLogger("headroom.proxy.routes").warning(
             "Rejected X-Original-Host %r: not in Copilot allowlist",
             original_host,
         )
-    return None
+        return None
+
+    return _explicit_copilot_api_override()
 
 
 def is_copilot_api_url(url: str | None) -> bool:

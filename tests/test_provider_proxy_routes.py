@@ -220,6 +220,7 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
             "api.business.githubcopilot.com",
             "api.enterprise.githubcopilot.com",
             "api-model-lab.githubcopilot.com",
+            "copilot-api.acme.ghe.com",
         ]:
             assert (
                 client.post(
@@ -240,6 +241,9 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
             "internal-service.corp",
             "evil.example.com",
             "api.githubcopilot.com.evil.com",   # subdomain confusion
+            "copilot-api.ghe.example.com",      # GHES custom domain without env pin
+            "api.acme.ghe.com",                 # GHE host but not copilot-api.*
+            "not-copilot-api.acme.ghe.com",
             "",
         ]:
             result = client.post(
@@ -1103,6 +1107,63 @@ def test_v1_models_routes_copilot_chat_via_x_original_host() -> None:
         ("/v1/models", "https://api.individual.githubcopilot.com", "openai"),
         ("/v1/models/gpt-4.1", "https://api.individual.githubcopilot.com", "openai"),
     ]
+
+
+def test_v1_models_routes_ghes_copilot_via_x_original_host() -> None:
+    """GHES Copilot Chat sends copilot-api.<tenant>.ghe.com via X-Original-Host."""
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            list_response = client.get(
+                "/v1/models",
+                headers={
+                    "authorization": "Bearer tid_test",
+                    "x-original-host": "copilot-api.acme.ghe.com",
+                    "user-agent": "GitHubCopilotChat/0.56.0",
+                },
+            )
+
+    assert list_response.status_code == 200
+    assert list_response.json() == {
+        "base_url": "https://copilot-api.acme.ghe.com",
+        "provider": "openai",
+    }
+    assert calls == [("/v1/models", "https://copilot-api.acme.ghe.com", "openai")]
+
+
+def test_v1_models_routes_custom_enterprise_via_x_original_host(
+    monkeypatch,
+) -> None:
+    """Custom GHES domains are accepted when GITHUB_COPILOT_ENTERPRISE_DOMAIN is set."""
+    monkeypatch.setenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", "ghe.example.com")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            list_response = client.get(
+                "/v1/models",
+                headers={
+                    "authorization": "Bearer tid_test",
+                    "x-original-host": "copilot-api.ghe.example.com",
+                    "user-agent": "GitHubCopilotChat/0.56.0",
+                },
+            )
+
+    assert list_response.status_code == 200
+    assert list_response.json() == {
+        "base_url": "https://copilot-api.ghe.example.com",
+        "provider": "openai",
+    }
+    assert calls == [("/v1/models", "https://copilot-api.ghe.example.com", "openai")]
 
 
 def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:

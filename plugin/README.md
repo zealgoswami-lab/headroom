@@ -238,9 +238,9 @@ Pair this with the VS Code settings above. `GITHUB_TOKEN` should be a token with
 | **GitHub.com — Individual** | Yes | Extension sends `X-Original-Host: api.individual.githubcopilot.com` when applicable. |
 | **GitHub.com — Business / Pro+** | Yes | Default `api.githubcopilot.com`. |
 | **GHEC** (GitHub Enterprise Cloud) | Yes | `api.business.githubcopilot.com` or `api.enterprise.githubcopilot.com` via `X-Original-Host`. Sign in with your enterprise account in VS Code. |
-| **GHES** (GitHub Enterprise Server, self-hosted) | **No** | On-prem Copilot uses instance-specific hostnames (e.g. `copilot-api.ghe.example.com`) that are **not** on Headroom's allowlist. Use `headroom wrap copilot` for Copilot CLI instead. |
+| **GHES** (GitHub Enterprise Server, self-hosted) | Yes | Extension sends `X-Original-Host: copilot-api.<tenant>.ghe.com` (hosted GHES) or `copilot-api.<your-domain>` for custom domains. Set `GITHUB_COPILOT_ENTERPRISE_DOMAIN=<your-domain>` (or `GITHUB_COPILOT_API_URL=https://copilot-api.<your-domain>`) on the proxy so custom hostnames are trusted. |
 
-Headroom's separate `headroom wrap copilot --subscription` path (Copilot CLI) supports custom enterprise domains via `GITHUB_COPILOT_ENTERPRISE_DOMAIN` — that is a different integration from VS Code Copilot Chat documented here.
+Headroom's separate `headroom wrap copilot --subscription` path (Copilot CLI) uses the same enterprise env vars (`GITHUB_COPILOT_ENTERPRISE_DOMAIN`, `GITHUB_COPILOT_API_URL`).
 
 ---
 
@@ -431,7 +431,7 @@ A `401` with routing metadata still proves the proxy accepted `X-Original-Host`;
 |---------|--------------|-----|
 | Copilot works but **no compression** / stats stay zero | Stock Copilot extension installed | Reinstall `copilot-proxy.vsix` with `--force`; verify extension ID shows the fork build. Disable auto-update. |
 | **`Connection refused`** on chat | Proxy not running or wrong port | Start `headroom proxy --port 8787` or Docker compose; match port in settings. |
-| **`Rejected X-Original-Host`** in proxy logs | Wrong extension build or enterprise GHES host | Reinstall patched VSIX; GHES is not supported (see enterprise table). |
+| **`Rejected X-Original-Host`** in proxy logs | Wrong extension build or unconfigured GHES domain | Reinstall patched VSIX; for custom GHES domains set `GITHUB_COPILOT_ENTERPRISE_DOMAIN` on the proxy (see enterprise table). |
 | **401 / 403 from Copilot** | Expired sign-in or missing token | Sign out/in of Copilot in VS Code; for Docker, set `GITHUB_TOKEN=$(gh auth token)`. |
 | **Extension version downgrade blocked** | VSIX older than installed Copilot Chat | Use `--force`; if VS Code refuses, uninstall Copilot Chat first, then install the VSIX. |
 | **Extension reverted after VS Code restart** | `extensions.autoUpdate` re-enabled | Set both `extensions.autoUpdate` and `extensions.autoCheckUpdates` to off; reload window. |

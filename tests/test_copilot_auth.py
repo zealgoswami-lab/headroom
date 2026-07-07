@@ -1014,3 +1014,69 @@ def test_exchange_token_sync_returns_payload_on_success(monkeypatch: pytest.Monk
     )
 
     assert result == payload
+
+
+def test_resolve_copilot_proxy_upstream_base_accepts_public_hosts() -> None:
+    headers = {"x-original-host": "api.individual.githubcopilot.com"}
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base(headers)
+        == "https://api.individual.githubcopilot.com"
+    )
+
+
+def test_resolve_copilot_proxy_upstream_base_accepts_ghe_copilot_hosts() -> None:
+    headers = {"x-original-host": "copilot-api.acme.ghe.com"}
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base(headers)
+        == "https://copilot-api.acme.ghe.com"
+    )
+
+
+def test_resolve_copilot_proxy_upstream_base_accepts_configured_enterprise_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", "ghe.example.com")
+    headers = {"x-original-host": "copilot-api.ghe.example.com"}
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base(headers)
+        == "https://copilot-api.ghe.example.com"
+    )
+
+
+def test_resolve_copilot_proxy_upstream_base_rejects_unconfigured_enterprise_host() -> None:
+    headers = {"x-original-host": "copilot-api.ghe.example.com"}
+    assert copilot_auth.resolve_copilot_proxy_upstream_base(headers) is None
+
+
+def test_resolve_copilot_proxy_upstream_base_rejects_non_copilot_hosts() -> None:
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base({"x-original-host": "evil.example.com"})
+        is None
+    )
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base(
+            {"x-original-host": "api.acme.ghe.com"}
+        )
+        is None
+    )
+
+
+def test_resolve_copilot_proxy_upstream_base_falls_back_to_configured_api_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://copilot-api.acme.ghe.com")
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base({})
+        == "https://copilot-api.acme.ghe.com"
+    )
+
+
+def test_resolve_copilot_proxy_upstream_base_falls_back_to_enterprise_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", "ghe.example.com")
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base({})
+        == "https://copilot-api.ghe.example.com"
+    )
+
