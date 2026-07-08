@@ -425,12 +425,16 @@ Expected output (trimmed):
 
 ```json
 {
-  "ready": true,
+  "service": "headroom-proxy",
   "status": "ok",
+  "ready": true,
+  "timestamp": "<ISO-8601 timestamp>",
+  "uptime_seconds": <number>,
+  "version": "<semver>",
   "checks": {
     "upstream": {
       "status": "ok",
-      "url": "https://api.individual.githubcopilot.com"
+      "url": "https://api.githubcopilot.com"
     }
   }
 }
@@ -438,10 +442,13 @@ Expected output (trimmed):
 
 Verify these fields:
 
+- `service` is present (for example `headroom-proxy`)
 - `ready` is `true`
 - `status` is `ok`
 - `checks.upstream.status` is `ok`
 - `checks.upstream.url` matches your Copilot host
+
+Values like `timestamp`, `uptime_seconds`, and runtime counters vary by environment and request timing.
 
 For Copilot users, `checks.upstream.url` should point to a Copilot host (for example `api.individual.githubcopilot.com`, `api.business.githubcopilot.com`, or `api.enterprise.githubcopilot.com`) — not `api.anthropic.com`.
 
