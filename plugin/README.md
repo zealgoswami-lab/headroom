@@ -12,6 +12,26 @@ This integration requires **three pieces working together**:
 
 ---
 
+## Index
+
+- [Architecture](#architecture)
+- [Why this uses a proxy architecture](#why-this-uses-a-proxy-architecture)
+- [Prerequisites](#prerequisites)
+- [Quick start (3 steps)](#quick-start-3-steps)
+- [Install the patched extension](#install-the-patched-extension)
+- [VS Code settings explained](#vs-code-settings-explained)
+- [Starting the Headroom proxy](#starting-the-headroom-proxy)
+- [Enterprise and plan support](#enterprise-and-plan-support)
+- [Windows notes](#windows-notes)
+- [WSL notes](#wsl-notes)
+- [Verification and testing](#verification-and-testing)
+- [Troubleshooting](#troubleshooting)
+- [Version compatibility](#version-compatibility)
+- [Updating the VSIX when VS Code updates](#updating-the-vsix-when-vs-code-updates)
+- [Related Headroom integrations](#related-headroom-integrations)
+- [MCP vs patched VSIX](#mcp-vs-patched-vsix)
+- [License and attribution](#license-and-attribution)
+
 ## Architecture
 
 Copilot Chat normally calls `https://api.githubcopilot.com` (or a plan-specific host). The patched extension instead sends OpenAI-compatible requests to Headroom on localhost. Headroom compresses prompts and tool context, then forwards the request upstream. The extension sets `X-Original-Host` so Headroom knows which Copilot API hostname to use — without that header, traffic would hit the wrong upstream or be rejected.
