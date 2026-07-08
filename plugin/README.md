@@ -15,6 +15,7 @@ This integration requires **three pieces working together**:
 ## Index
 
 - [Architecture](#architecture)
+- [Network egress and data flow](#network-egress-and-data-flow)
 - [Why this uses a proxy architecture](#why-this-uses-a-proxy-architecture)
 - [Prerequisites](#prerequisites)
 - [Quick start (3 steps)](#quick-start-3-steps)
@@ -75,6 +76,15 @@ The `X-Original-Host` allowlist in `headroom/providers/proxy_routes.py` is inten
 | `api-model-lab.githubcopilot.com` | Model lab / preview endpoints |
 
 Any other value is logged and ignored — the proxy will not forward to arbitrary hosts.
+
+## Network egress and data flow
+
+Yes, data goes out of your local machine/network in normal Copilot usage.
+
+- **What stays local first:** Copilot request payloads go to local Headroom (`localhost:8787`) where compression and routing happen.
+- **What goes upstream:** after compression, Headroom forwards the request to GitHub Copilot API hosts (`api.*.githubcopilot.com`) and receives the model response back.
+- **Practical meaning:** Headroom reduces token volume and adds observability, but it is not an offline/local-only Copilot mode.
+- **How to keep traffic inside enterprise boundaries:** use your organization's approved Copilot Enterprise/GHE endpoint configuration (`GITHUB_COPILOT_API_URL` / enterprise domain settings) and network controls.
 
 ## Why this uses a proxy architecture
 
@@ -413,7 +423,18 @@ curl -s http://localhost:8787/stats | jq '.savings // .'
 
 ---
 
-### 1. Proxy health
+### 1. Quick check: is traffic going through Headroom?
+
+When you send a Copilot Chat message (or use another client like Cursor configured to `http://localhost:8787`), traffic is going through Headroom if **all** of the following are true:
+
+- Proxy is running on `http://localhost:8787` (for example `headroom proxy --port 8787`).
+- `curl http://localhost:8787/readyz` returns HTTP 200 with `"ready": true`.
+- While you chat, the proxy terminal shows requests with `X-Original-Host` (for Copilot) or your provider host, and **not** just health checks.
+- `curl http://localhost:8787/stats` shows non-zero `savings` after a few requests.
+
+If your chat still works but proxy logs stay empty, the client is likely talking directly to the upstream provider instead of Headroom (routing misconfigured).
+
+### 2. Proxy health
 
 ```bash
 curl -s http://localhost:8787/readyz | jq .
@@ -454,7 +475,7 @@ For Copilot users, `checks.upstream.url` should point to a Copilot host (for exa
 
 If the upstream URL is wrong, restart the proxy with `OPENAI_TARGET_API_URL` set to your Copilot endpoint.
 
-### 2. Copilot Chat end-to-end
+### 3. Copilot Chat end-to-end
 
 1. Confirm you are signed into GitHub Copilot in VS Code (account menu).
 2. Open Copilot Chat, send a message that pulls repo context (e.g. "Summarize this project").
@@ -464,7 +485,7 @@ If the upstream URL is wrong, restart the proxy with `OPENAI_TARGET_API_URL` set
    ```
    Look for upstream routing to `https://api.*.githubcopilot.com` and no `Rejected X-Original-Host` warnings.
 
-### 3. Token savings
+### 4. Token savings
 
 ```bash
 curl -s http://localhost:8787/stats | jq '.savings // .'
@@ -472,7 +493,7 @@ curl -s http://localhost:8787/stats | jq '.savings // .'
 
 Or run `headroom dashboard` in another terminal.
 
-### 4. Manual header check (optional)
+### 5. Manual header check (optional)
 
 If you need to confirm allowlist behavior without VS Code:
 
