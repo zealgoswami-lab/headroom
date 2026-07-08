@@ -56,6 +56,16 @@ The `X-Original-Host` allowlist in `headroom/providers/proxy_routes.py` is inten
 
 Any other value is logged and ignored — the proxy will not forward to arbitrary hosts.
 
+## Why this uses a proxy architecture
+
+This integration uses a local proxy because it is the only reliable way to apply Headroom automatically on every Copilot Chat turn while keeping the normal Copilot UX.
+
+- **Automatic per-turn interception/compression:** every chat request and tool payload passes through Headroom, so compression happens without manual copy/paste or prompt wrappers.
+- **Copilot compatibility:** the patched extension keeps Copilot auth/session behavior and streaming response handling, while Headroom forwards requests upstream.
+- **Centralized upstream routing:** `X-Original-Host` lets one local endpoint route to the correct plan-specific Copilot host safely.
+- **Observability in one place:** `/stats`, proxy logs, and dashboard views show savings and request behavior across all chats.
+- **Why not MCP-only or manual tools:** those can assist with workflows, but they do not automatically intercept native Copilot Chat traffic on every turn.
+
 ---
 
 ## Prerequisites
