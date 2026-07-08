@@ -3037,6 +3037,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     },
                     "compression": {
                         "tokens": proxy_compression_tokens,
+                        # Explicit names for API consumers:
+                        # - received_tokens: before Headroom compression
+                        # - compressed_tokens: after Headroom compression
+                        # - total_saved_tokens: proxy + context-tool filtering
+                        "received_tokens": proxy_total_before_compression,
+                        "compressed_tokens": m.tokens_input_total,
+                        "total_saved_tokens": all_layers_tokens_saved,
+                        "total_saved_percent": round(
+                            (all_layers_tokens_saved / total_tokens_before * 100)
+                            if total_tokens_before > 0
+                            else 0,
+                            2,
+                        ),
                         "proxy_tokens": proxy_compression_tokens,
                         "cli_filtering_tokens": cli_tokens_avoided,
                         "rtk_tokens": rtk_tokens_avoided,
@@ -3076,6 +3089,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "by_stack": dict(m.requests_by_stack),
             },
             "tokens": {
+                # Canonical naming for "received -> compressed -> saved"
+                # reporting in dashboards and API clients.
+                "received_tokens": proxy_total_before_compression,
+                "compressed_tokens": m.tokens_input_total,
+                "total_saved_tokens": all_layers_tokens_saved,
+                "total_saved_percent": round(
+                    (all_layers_tokens_saved / total_tokens_before * 100)
+                    if total_tokens_before > 0
+                    else 0,
+                    2,
+                ),
                 "input": m.tokens_input_total,
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),
