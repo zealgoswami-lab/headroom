@@ -421,6 +421,32 @@ curl -s http://localhost:8787/readyz | jq .
 
 Expect HTTP 200 and `"ready": true`. Docker health checks use the same endpoint.
 
+Expected output (trimmed):
+
+```json
+{
+  "ready": true,
+  "status": "ok",
+  "checks": {
+    "upstream": {
+      "status": "ok",
+      "url": "https://api.individual.githubcopilot.com"
+    }
+  }
+}
+```
+
+Verify these fields:
+
+- `ready` is `true`
+- `status` is `ok`
+- `checks.upstream.status` is `ok`
+- `checks.upstream.url` matches your Copilot host
+
+For Copilot users, `checks.upstream.url` should point to a Copilot host (for example `api.individual.githubcopilot.com`, `api.business.githubcopilot.com`, or `api.enterprise.githubcopilot.com`) — not `api.anthropic.com`.
+
+If the upstream URL is wrong, restart the proxy with `OPENAI_TARGET_API_URL` set to your Copilot endpoint.
+
 ### 2. Copilot Chat end-to-end
 
 1. Confirm you are signed into GitHub Copilot in VS Code (account menu).
