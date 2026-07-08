@@ -199,6 +199,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
+| VS Code Copilot Chat | Manual setup    | [`zealgoswami-lab/headroom`](https://github.com/zealgoswami-lab/headroom) fork hosts [`plugin/`](plugin/README.md) (patched VSIX + `headroom proxy` + VS Code settings) — [guide](plugin/README.md); not `headroom wrap` |
 | OpenClaw     | ✅              | installs as ContextEngine plugin |
 | OpenCode     | ✅              | injects config · starts proxy + launches |
 | Cline        | ✅              | starts proxy + injects config    |
@@ -240,6 +241,10 @@ override. Headroom uses GitHub's normal token-exchange endpoint and the Copilot
 API endpoint advertised for the signed-in account.
 
 Platform support note: macOS auth reuse via Copilot CLI Keychain storage has been smoke-tested. Windows Credential Manager, Linux Secret Service / `secret-tool`, and Docker/CI token-injection paths are implemented or planned as auth-discovery paths, but still need real OS validation before they should be considered fully vetted. For Docker and CI, prefer passing an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` rather than relying on host keychain access.
+
+### VS Code Copilot Chat
+
+Three pieces: **[`zealgoswami-lab/headroom`](https://github.com/zealgoswami-lab/headroom)** proxy + [`plugin/`](plugin/README.md) (bundled `copilot-proxy.vsix` from [`damnthonyy/vscode`](https://github.com/damnthonyy/vscode)) + VS Code settings. Full walkthrough: **[`plugin/README.md`](plugin/README.md)**. This integration ships in the zealgoswami-lab fork until it lands in canonical [`headroomlabs-ai/headroom`](https://github.com/headroomlabs-ai/headroom) ([`chopratejas/headroom`](https://github.com/chopratejas/headroom) redirects there).
 
 ## When to use · When to skip
 
@@ -453,9 +458,11 @@ Headroom runs **locally**, covers **every** content type, works with every major
 ## Contributing
 
 ```bash
-git clone https://github.com/chopratejas/headroom.git && cd headroom
+git clone https://github.com/headroomlabs-ai/headroom.git && cd headroom
 uv sync --extra dev && uv run pytest
 ```
+
+(`chopratejas/headroom` redirects to the same repo.)
 
 Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j). See [CONTRIBUTING.md](CONTRIBUTING.md).
 

@@ -1,6 +1,8 @@
 # VS Code Copilot Chat Integration
 
-Route GitHub Copilot Chat traffic through [Headroom](https://github.com/chopratejas/headroom) for context compression — same Copilot models and subscription, fewer tokens on every chat turn.
+Route GitHub Copilot Chat traffic through [Headroom](https://github.com/headroomlabs-ai/headroom) for context compression — same Copilot models and subscription, fewer tokens on every chat turn.
+
+This integration spans **three GitHub projects**: upstream Headroom ([`headroomlabs-ai/headroom`](https://github.com/headroomlabs-ai/headroom), formerly `chopratejas/headroom`), the zealgoswami-lab fork that adds this `plugin/` integration ([`zealgoswami-lab/headroom`](https://github.com/zealgoswami-lab/headroom)), and the patched Copilot Chat VSIX ([`damnthonyy/vscode`](https://github.com/damnthonyy/vscode)). See [Upstream Headroom vs zealgoswami-lab fork vs patched VSIX](#upstream-headroom-vs-zealgoswami-lab-fork-vs-patched-vsix) for how they differ.
 
 This integration requires **three pieces working together**:
 
@@ -15,6 +17,7 @@ This integration requires **three pieces working together**:
 ## Index
 
 - [Architecture](#architecture)
+- [Upstream Headroom vs zealgoswami-lab fork vs patched VSIX](#upstream-headroom-vs-zealgoswami-lab-fork-vs-patched-vsix)
 - [Network egress and data flow](#network-egress-and-data-flow)
 - [Why this uses a proxy architecture](#why-this-uses-a-proxy-architecture)
 - [Prerequisites](#prerequisites)
@@ -76,6 +79,43 @@ The `X-Original-Host` allowlist in `headroom/providers/proxy_routes.py` is inten
 | `api-model-lab.githubcopilot.com` | Model lab / preview endpoints |
 
 Any other value is logged and ignored — the proxy will not forward to arbitrary hosts.
+
+## Upstream Headroom vs zealgoswami-lab fork vs patched VSIX
+
+People often mix these up. This Copilot integration involves **three separate GitHub projects**, not one monolithic fork:
+
+| Component | GitHub repo | What it is | What it does | What it does not do |
+|-----------|-------------|------------|--------------|---------------------|
+| **Upstream Headroom** | [`headroomlabs-ai/headroom`](https://github.com/headroomlabs-ai/headroom) (formerly [`chopratejas/headroom`](https://github.com/chopratejas/headroom)) | Canonical Headroom proxy/compression project | Python proxy (`headroom proxy`), CCR compression, MCP server, `headroom wrap` for CLI agents, PyPI releases (`headroom-ai`) | Does not ship a VS Code Copilot Chat plugin or patched VSIX |
+| **zealgoswami-lab fork** | [`zealgoswami-lab/headroom`](https://github.com/zealgoswami-lab/headroom) | Personal/org fork of upstream Headroom | Adds the `plugin/` directory (this README, bundled `copilot-proxy.vsix`, VS Code settings), `X-Original-Host` Copilot routing in the proxy, Docker `vscode-plugin-builder`, and Copilot overlay compose files | Not the canonical release channel; diverges from upstream (custom commits ahead, missing upstream fixes behind) |
+| **Patched Copilot Chat extension** | [`damnthonyy/vscode`](https://github.com/damnthonyy/vscode) VSIX | Modified Microsoft Copilot Chat extension | Sends Copilot Chat traffic to `http://localhost:8787/v1` and sets `X-Original-Host` for plan-specific upstream routing | Does not compress context or expose `/stats` by itself |
+
+### What zealgoswami-lab fork means
+
+**`zealgoswami-lab/headroom`** is the fork of upstream Headroom that layers the VS Code Copilot Chat integration on top — the `plugin/` directory, bundled VSIX, and Copilot-specific proxy routing documented here. A separate stale personal mirror exists at [`agoswami84/headroom_open_source_model`](https://github.com/agoswami84/headroom_open_source_model); it is not maintained for this workflow.
+
+Upstream Headroom and the zealgoswami-lab fork are both **Headroom proxy codebases** (Python/Rust). The damnthonyy project is a **VS Code extension fork** — a different artifact entirely.
+
+### chopratejas/headroom vs headroomlabs-ai/headroom
+
+[`chopratejas/headroom`](https://github.com/chopratejas/headroom) now resolves to the organization repo [`headroomlabs-ai/headroom`](https://github.com/headroomlabs-ai/headroom). Same project — canonical source, issues, and releases live under `headroomlabs-ai/headroom`. Docs and PyPI still reference `chopratejas` in places (Docker image `ghcr.io/chopratejas/headroom`, HuggingFace models, etc.).
+
+### What to install for this integration
+
+You need **all three pieces**:
+
+1. **Headroom proxy** — run from this repo (`zealgoswami-lab/headroom`) or, once merged upstream, from `headroomlabs-ai/headroom`. The proxy code in the zealgoswami-lab fork includes Copilot-specific `X-Original-Host` routing that stock upstream may not yet ship.
+2. **Patched VSIX** — install `plugin/copilot-proxy.vsix` (built from `damnthonyy/vscode`).
+3. **VS Code settings** — `github.copilot.chat.proxy.url` and extension auto-update disabled (see [Quick start](#quick-start-3-steps)).
+
+In short:
+
+- **Upstream Headroom = canonical compression engine + observability**
+- **zealgoswami-lab fork (`zealgoswami-lab/headroom`) = upstream Headroom + Copilot Chat plugin integration in `plugin/`**
+- **damnthonyy VSIX = traffic redirector from VS Code to Headroom**
+- Removing the proxy or the patched VSIX breaks automatic per-turn Copilot compression.
+
+For production proxy/compression outside VS Code Copilot Chat, prefer **upstream** [`headroomlabs-ai/headroom`](https://github.com/headroomlabs-ai/headroom) releases. Use this fork when you specifically need the bundled Copilot Chat VSIX workflow documented here.
 
 ## Network egress and data flow
 
@@ -493,6 +533,46 @@ curl -s http://localhost:8787/stats | jq '.savings // .'
 
 Or run `headroom dashboard` in another terminal.
 
+No extra per-user command is required once the proxy is running and traffic is routed through it. Any dashboard/client can read these directly from `/stats`:
+
+```bash
+curl -s http://localhost:8787/stats | jq '.compression_summary'
+```
+
+For a compact headline view:
+
+```bash
+curl -s http://localhost:8787/stats | jq '.compression_summary | {proxy, cli_filtering, all_layers}'
+```
+
+### `compression_summary` (preferred)
+
+| Block | Key fields | Meaning |
+|-------|------------|---------|
+| **`proxy`** | `received_tokens`, `forwarded_tokens`, `tokens_saved`, `savings_percent_of_received` | Proxy HTTP-path compression only. `received_tokens` = pre-compression request input; `forwarded_tokens` = tokens sent upstream after compression. |
+| **`proxy`** | `attempted_tokens`, `active_savings_percent_of_attempted` | Compressible-only denominator (excludes prefix-frozen content). Answers “how well did we compress what we tried to compress?” |
+| **`cli_filtering`** | `tokens_saved`, `tool`, `label` | Tokens avoided by RTK / lean-ctx before requests reach the proxy. Not included in `proxy.received_tokens`. |
+| **`all_layers`** | `received_tokens`, `forwarded_tokens`, `tokens_saved`, `savings_percent_of_received` | Combined proxy + CLI filtering. `received_tokens = forwarded_tokens + proxy.tokens_saved + cli_filtering.tokens_saved`. |
+| **`display_session`** | `received_tokens`, `forwarded_tokens`, `tokens_saved`, `savings_percent_of_received` | Persisted proxy-compression session (rollover after inactivity). Proxy-layer only. |
+
+### `tokens` (backward-compatible aliases)
+
+```bash
+curl -s http://localhost:8787/stats | jq '.tokens | {proxy_received_tokens, proxy_forwarded_tokens, proxy_tokens_saved, all_layers_received_tokens, all_layers_tokens_saved, total_saved_percent}'
+```
+
+| Field | Scope | Meaning |
+|-------|-------|---------|
+| `received_tokens` | proxy | Alias of `proxy_received_tokens` — before proxy compression |
+| `forwarded_tokens` / `compressed_tokens` | proxy | Tokens forwarded upstream after proxy compression |
+| `proxy_tokens_saved` | proxy | Tokens removed by proxy compression |
+| `all_layers_received_tokens` | all layers | Counterfactual input before any Headroom reduction |
+| `all_layers_tokens_saved` / `total_saved_tokens` | all layers | Proxy compression + CLI filtering |
+| `total_saved_percent` | all layers | `all_layers_tokens_saved / all_layers_received_tokens * 100` |
+| `input` | proxy | Legacy alias of `forwarded_tokens` (post-compression input total) |
+
+Legacy fields (`saved`, `proxy_compression_saved`, `savings_percent`) remain unchanged for older dashboards.
+
 ### 5. Manual header check (optional)
 
 If you need to confirm allowlist behavior without VS Code:
@@ -616,7 +696,14 @@ Start the proxy on the same host/port before using MCP tools. Tool calls use the
 
 ## License and attribution
 
-- **Headroom** — [Apache 2.0](../LICENSE)
+- **Upstream Headroom** — [Apache 2.0](../LICENSE), canonical repo [`headroomlabs-ai/headroom`](https://github.com/headroomlabs-ai/headroom) (formerly `chopratejas/headroom`).
+- **zealgoswami-lab fork** — same Apache 2.0 license as upstream; Copilot Chat integration commits live in [`zealgoswami-lab/headroom`](https://github.com/zealgoswami-lab/headroom) until contributed upstream.
 - **Patched Copilot Chat extension** — derived from Microsoft's GitHub Copilot Chat extension, modified in the [damnthonyy/vscode](https://github.com/damnthonyy/vscode) fork to support `github.copilot.chat.proxy.url` routing and `X-Original-Host` forwarding. This is third-party software, not published by Microsoft or GitHub. Review the fork's license terms before use in regulated environments.
 
-When reporting issues, distinguish **Headroom proxy** bugs (file in [chopratejas/headroom](https://github.com/chopratejas/headroom)) from **VSIX / fork** bugs (file in [damnthonyy/vscode](https://github.com/damnthonyy/vscode)).
+When reporting issues, distinguish:
+
+| Symptom area | Where to file |
+|--------------|---------------|
+| Compression, `/stats`, general proxy (upstream behavior) | [headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom) |
+| Copilot Chat plugin docs, bundled VSIX, `plugin/` integration | [zealgoswami-lab/headroom](https://github.com/zealgoswami-lab/headroom) |
+| VSIX build, extension routing, `github.copilot.chat.proxy.url` | [damnthonyy/vscode](https://github.com/damnthonyy/vscode) |

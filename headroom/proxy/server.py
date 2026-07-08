@@ -117,6 +117,7 @@ from headroom.proxy.cost import (
     _CACHE_ECONOMICS,  # noqa: F401
     CostTracker,  # noqa: F401
     _summarize_transforms,  # noqa: F401
+    build_compression_summary,  # noqa: F401
     build_prefix_cache_stats,  # noqa: F401
     build_session_summary,  # noqa: F401
     merge_cost_stats,  # noqa: F401
@@ -2999,9 +3000,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:  # pragma: no cover - defensive
             pass
 
+        compression_summary = build_compression_summary(
+            proxy_compression_tokens=proxy_compression_tokens,
+            proxy_total_before_compression=proxy_total_before_compression,
+            forwarded_tokens=m.tokens_input_total,
+            cli_tokens_avoided=cli_tokens_avoided,
+            total_tokens_before=total_tokens_before,
+            all_layers_tokens_saved=all_layers_tokens_saved,
+            attempted_input_tokens=attempted_input_tokens,
+            cli_filtering_tool=cli_filtering_tool,
+            cli_filtering_label=cli_filtering_label,
+            display_session=display_session,
+        )
+
         return {
             "summary": summary,
             "agent_usage": agent_usage,
+            "compression_summary": compression_summary,
             "savings": {
                 "total_tokens": total_tokens_all_layers,
                 "per_project": persistent_savings.get("projects", {}),
@@ -3037,27 +3052,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     },
                     "compression": {
                         "tokens": proxy_compression_tokens,
+                        "proxy": compression_summary["proxy"],
+                        "all_layers": compression_summary["all_layers"],
                         # Explicit names for API consumers:
-                        # - received_tokens: before Headroom compression
-                        # - compressed_tokens: after Headroom compression
-                        # - total_saved_tokens: proxy + context-tool filtering
+                        # - received_tokens / compressed_tokens: proxy layer only
+                        # - total_saved_*: all layers (proxy + CLI filtering)
                         "received_tokens": proxy_total_before_compression,
+                        "forwarded_tokens": m.tokens_input_total,
                         "compressed_tokens": m.tokens_input_total,
+                        "proxy_tokens_saved": proxy_compression_tokens,
+                        "proxy_savings_percent_of_received": compression_summary["proxy"][
+                            "savings_percent_of_received"
+                        ],
                         "total_saved_tokens": all_layers_tokens_saved,
-                        "total_saved_percent": round(
-                            (all_layers_tokens_saved / total_tokens_before * 100)
-                            if total_tokens_before > 0
-                            else 0,
-                            2,
-                        ),
+                        "total_saved_percent": compression_summary["all_layers"][
+                            "savings_percent_of_received"
+                        ],
+                        "all_layers_received_tokens": total_tokens_before,
+                        "all_layers_savings_percent_of_received": compression_summary[
+                            "all_layers"
+                        ]["savings_percent_of_received"],
                         "proxy_tokens": proxy_compression_tokens,
                         "cli_filtering_tokens": cli_tokens_avoided,
                         "rtk_tokens": rtk_tokens_avoided,
                         "lean_ctx_tokens": lean_ctx_tokens_avoided,
                         "all_layers_tokens": all_layers_tokens_saved,
                         "description": (
-                            "Tokens removed by Headroom proxy compression. "
-                            "Dashboard token savings also includes CLI context-tool filtering."
+                            "Proxy-layer compression counters (received/forwarded/proxy_tokens_saved) "
+                            "vs combined dashboard savings (total_saved_* / all_layers_*). "
+                            "CLI filtering is reported separately in by_layer.cli_filtering."
                         ),
                     },
                     "prefix_cache": {
@@ -3089,17 +3112,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "by_stack": dict(m.requests_by_stack),
             },
             "tokens": {
-                # Canonical naming for "received -> compressed -> saved"
-                # reporting in dashboards and API clients.
+                # Canonical naming for "received -> forwarded -> saved"
+                # reporting in dashboards and API clients. Prefer
+                # compression_summary for precise per-layer breakdowns.
                 "received_tokens": proxy_total_before_compression,
+                "forwarded_tokens": m.tokens_input_total,
                 "compressed_tokens": m.tokens_input_total,
+                "proxy_received_tokens": proxy_total_before_compression,
+                "proxy_forwarded_tokens": m.tokens_input_total,
+                "proxy_tokens_saved": proxy_compression_tokens,
+                "all_layers_received_tokens": total_tokens_before,
+                "all_layers_forwarded_tokens": m.tokens_input_total,
+                "all_layers_tokens_saved": all_layers_tokens_saved,
                 "total_saved_tokens": all_layers_tokens_saved,
-                "total_saved_percent": round(
-                    (all_layers_tokens_saved / total_tokens_before * 100)
-                    if total_tokens_before > 0
-                    else 0,
-                    2,
-                ),
+                "total_saved_percent": compression_summary["all_layers"][
+                    "savings_percent_of_received"
+                ],
                 "input": m.tokens_input_total,
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),

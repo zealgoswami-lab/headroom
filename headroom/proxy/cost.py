@@ -600,6 +600,106 @@ def build_session_summary(
     return summary
 
 
+def _savings_percent_of_received(saved: int | float, received: int | float) -> float:
+    return round((float(saved) / float(received)) * 100.0, 2) if received else 0.0
+
+
+def build_compression_summary(
+    *,
+    proxy_compression_tokens: int,
+    proxy_total_before_compression: int,
+    forwarded_tokens: int,
+    cli_tokens_avoided: int,
+    total_tokens_before: int,
+    all_layers_tokens_saved: int,
+    attempted_input_tokens: int,
+    cli_filtering_tool: str,
+    cli_filtering_label: str,
+    display_session: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a precise token-savings breakdown for ``/stats``.
+
+    Separates proxy-layer compression (received → forwarded upstream) from
+    CLI context-tool filtering (tokens avoided before the proxy) and the
+    combined all-layers view dashboards use for headline savings.
+    """
+    proxy_block = {
+        "received_tokens": proxy_total_before_compression,
+        "forwarded_tokens": forwarded_tokens,
+        "compressed_tokens": forwarded_tokens,
+        "tokens_saved": proxy_compression_tokens,
+        "savings_percent_of_received": _savings_percent_of_received(
+            proxy_compression_tokens,
+            proxy_total_before_compression,
+        ),
+        "attempted_tokens": attempted_input_tokens,
+        "active_savings_percent_of_attempted": _savings_percent_of_received(
+            proxy_compression_tokens,
+            attempted_input_tokens,
+        ),
+        "description": (
+            "Proxy HTTP-path compression only: received = pre-compression request "
+            "input; forwarded = tokens sent upstream after compression."
+        ),
+    }
+    cli_block = {
+        "tool": cli_filtering_tool,
+        "label": cli_filtering_label,
+        "tokens_saved": cli_tokens_avoided,
+        "description": (
+            "Tokens avoided by the configured CLI context tool before requests "
+            "reach proxy compression. Not included in proxy received/forwarded totals."
+        ),
+    }
+    all_layers_block = {
+        "received_tokens": total_tokens_before,
+        "forwarded_tokens": forwarded_tokens,
+        "tokens_saved": all_layers_tokens_saved,
+        "savings_percent_of_received": _savings_percent_of_received(
+            all_layers_tokens_saved,
+            total_tokens_before,
+        ),
+        "description": (
+            "Combined proxy compression + CLI filtering. "
+            "received_tokens = forwarded_tokens + proxy.tokens_saved + cli_filtering.tokens_saved."
+        ),
+    }
+    session_tokens_saved = int(display_session.get("tokens_saved", 0) or 0)
+    session_forwarded = int(display_session.get("total_input_tokens", 0) or 0)
+    session_received = session_tokens_saved + session_forwarded
+    session_block = {
+        "requests": int(display_session.get("requests", 0) or 0),
+        "received_tokens": session_received,
+        "forwarded_tokens": session_forwarded,
+        "tokens_saved": session_tokens_saved,
+        "savings_percent_of_received": float(display_session.get("savings_percent", 0.0) or 0.0),
+        "compression_savings_usd": float(display_session.get("compression_savings_usd", 0.0) or 0.0),
+        "started_at": display_session.get("started_at"),
+        "last_activity_at": display_session.get("last_activity_at"),
+        "description": (
+            "Persisted proxy-compression session (rollover after inactivity). "
+            "Proxy-layer only — excludes CLI filtering."
+        ),
+    }
+    return {
+        "proxy": proxy_block,
+        "cli_filtering": cli_block,
+        "all_layers": all_layers_block,
+        "display_session": session_block,
+        "field_guide": {
+            "received_tokens": "Counterfactual input size before the layer removes tokens.",
+            "forwarded_tokens": "Tokens actually sent upstream after proxy compression.",
+            "compressed_tokens": "Alias of forwarded_tokens (proxy layer).",
+            "tokens_saved": "received_tokens - forwarded_tokens for the layer scope.",
+            "savings_percent_of_received": "tokens_saved / received_tokens * 100 for the layer scope.",
+            "active_savings_percent_of_attempted": (
+                "Proxy only: tokens_saved / attempted_tokens * 100 over compressible "
+                "candidates (excludes prefix-frozen content)."
+            ),
+        },
+    }
+
+
 class CostTracker:
     """Track costs and enforce budgets.
 
