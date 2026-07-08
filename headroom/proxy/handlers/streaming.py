@@ -30,6 +30,51 @@ from headroom.copilot_auth import apply_copilot_api_auth
 logger = logging.getLogger("headroom.proxy")
 
 
+def _headroom_stream_savings_headers(
+    *,
+    model: str,
+    original_tokens: int,
+    optimized_tokens: int,
+    tokens_saved: int,
+    transforms_applied: list[str] | None = None,
+) -> dict[str, str]:
+    """Response headers exposing per-turn compression savings on streaming paths."""
+    headers = {
+        "x-headroom-tokens-before": str(original_tokens),
+        "x-headroom-tokens-after": str(optimized_tokens),
+        "x-headroom-tokens-saved": str(tokens_saved),
+        "x-headroom-model": model,
+    }
+    if transforms_applied:
+        from headroom.proxy.cost import header_safe_transforms
+
+        headers["x-headroom-transforms"] = ",".join(header_safe_transforms(transforms_applied))
+    return headers
+
+
+def _headroom_stream_stats_sse_event(
+    *,
+    model: str,
+    original_tokens: int,
+    optimized_tokens: int,
+    tokens_saved: int,
+    transforms_applied: list[str] | None = None,
+) -> bytes:
+    """Trailing SSE event so streaming clients can read savings after the upstream stream."""
+    payload: dict[str, Any] = {
+        "type": "headroom_stats",
+        "tokens_before": original_tokens,
+        "tokens_after": optimized_tokens,
+        "tokens_saved": tokens_saved,
+        "model": model,
+    }
+    if transforms_applied:
+        from headroom.proxy.cost import header_safe_transforms
+
+        payload["transforms"] = header_safe_transforms(transforms_applied)
+    return f"event: headroom_stats\ndata: {json.dumps(payload)}\n\n".encode()
+
+
 def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
     """Extract `usage.completion_tokens` from a single SSE chunk if present.
 
@@ -1210,6 +1255,15 @@ class StreamingMixin:
                 waste_signals=waste_signals,
             )
             self._cleanup_mid_turn_stream(session_key)
+            response_headers.update(
+                _headroom_stream_savings_headers(
+                    model=model,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                )
+            )
             return Response(
                 content=error_content,
                 status_code=upstream_response.status_code,
@@ -1232,6 +1286,15 @@ class StreamingMixin:
             or k.lower().startswith("x-codex")
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
+        forwarded_headers.update(
+            _headroom_stream_savings_headers(
+                model=model,
+                original_tokens=original_tokens,
+                optimized_tokens=optimized_tokens,
+                tokens_saved=tokens_saved,
+                transforms_applied=transforms_applied,
+            )
+        )
 
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
@@ -1488,6 +1551,13 @@ class StreamingMixin:
                     client=client,
                     waste_signals=waste_signals,
                 )
+                yield _headroom_stream_stats_sse_event(
+                    model=model,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                )
                 if pending_messages:
                     pending_event = json.dumps(
                         {"type": "headroom_pending_messages", "messages": pending_messages}
@@ -1698,6 +1768,13 @@ class StreamingMixin:
 
         assert self.anthropic_backend is not None
         client = classify_client(headers)
+        stream_headers = _headroom_stream_savings_headers(
+            model=model,
+            original_tokens=original_tokens,
+            optimized_tokens=optimized_tokens,
+            tokens_saved=tokens_saved,
+            transforms_applied=transforms_applied,
+        )
 
         async def generate():
             stream_state: dict[str, Any] = {
@@ -1856,7 +1933,16 @@ class StreamingMixin:
                         f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name} [stream]"
                     )
 
+                yield _headroom_stream_stats_sse_event(
+                    model=model,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                )
+
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
+            headers=stream_headers,
         )
