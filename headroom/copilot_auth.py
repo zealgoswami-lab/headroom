@@ -26,7 +26,7 @@ from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_mac
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_URL = "https://api.githubcopilot.com"
+DEFAULT_API_URL = "https://api.business.githubcopilot.com"
 DEFAULT_TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 DEFAULT_USER_INFO_URL = "https://api.github.com/copilot_internal/user"
 DEFAULT_GITHUB_HOST = "github.com"
@@ -756,17 +756,27 @@ def _api_url_from_payload(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None) -> str:
-    api_url = _api_url_from_payload(payload)
-    if not api_url:
-        return _configured_api_url()
+def _resolve_advertised_copilot_api_url(api_url: str) -> str:
+    """Map GitHub-advertised Copilot API URLs to the configured routing base.
+
+    Generic and individual public hosts normalize to ``_configured_api_url()`` so
+    the default upstream is Business unless the client or operator selects
+    another allowed host via ``X-Original-Host`` or env overrides.
+    """
 
     host = urlparse(api_url).netloc.lower()
     if host in {"api.githubcopilot.com", "api.individual.githubcopilot.com"}:
         return _configured_api_url()
     if host.endswith(".githubcopilot.com"):
-        return api_url
+        return api_url.rstrip("/")
     return _configured_api_url()
+
+
+def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None) -> str:
+    api_url = _api_url_from_payload(payload)
+    if not api_url:
+        return _configured_api_url()
+    return _resolve_advertised_copilot_api_url(api_url)
 
 
 def _subscription_api_url_from_user_info(oauth_token: str) -> str:
@@ -781,7 +791,7 @@ def _api_url_from_exchange_payload(payload: dict[str, Any], *, oauth_token: str)
     api_url = _api_url_from_payload(payload)
     if api_url:
         if is_copilot_api_url(api_url):
-            return api_url
+            return _resolve_advertised_copilot_api_url(api_url)
         logger.warning(
             "Ignoring non-Copilot API URL from token exchange payload: %s",
             api_url,
@@ -1034,7 +1044,7 @@ def resolve_copilot_api_url(oauth_token: str | None = None) -> str:
 
     1. An explicit ``GITHUB_COPILOT_API_URL`` — the operator's escape hatch
        (corporate proxy, enterprise / data-residency host, tests).
-    2. The generic public host ``https://api.githubcopilot.com``.
+    2. The Business public host ``https://api.business.githubcopilot.com``.
 
     The account-specific ``endpoints.api`` advertised by ``/copilot_internal/user``
     is intentionally NOT used to route. It returns a segmented host (e.g.

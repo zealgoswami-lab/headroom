@@ -335,6 +335,57 @@ def test_copilot_api_url_from_enterprise_url_ignores_github_cloud_enterprise_pat
     )
 
 
+def test_default_api_url_is_business_host() -> None:
+    assert copilot_auth.DEFAULT_API_URL == "https://api.business.githubcopilot.com"
+
+
+def test_configured_api_url_defaults_to_business_without_env() -> None:
+    assert copilot_auth._configured_api_url() == copilot_auth.DEFAULT_API_URL
+
+
+def test_configured_api_url_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.githubcopilot.com")
+    assert copilot_auth._configured_api_url() == "https://api.githubcopilot.com"
+
+
+def test_resolve_copilot_api_url_defaults_to_business_without_env() -> None:
+    assert copilot_auth.resolve_copilot_api_url("gho-anything") == copilot_auth.DEFAULT_API_URL
+
+
+def test_resolve_advertised_copilot_api_url_maps_generic_host_to_business_default() -> None:
+    assert (
+        copilot_auth._resolve_advertised_copilot_api_url("https://api.githubcopilot.com")
+        == copilot_auth.DEFAULT_API_URL
+    )
+    assert (
+        copilot_auth._resolve_advertised_copilot_api_url(
+            "https://api.individual.githubcopilot.com"
+        )
+        == copilot_auth.DEFAULT_API_URL
+    )
+
+
+def test_api_url_from_exchange_payload_maps_generic_host_to_business_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(copilot_auth, "_fetch_copilot_user_info", lambda _token: None)
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.githubcopilot.com"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == copilot_auth.DEFAULT_API_URL
+
+
+def test_resolve_copilot_proxy_upstream_base_respects_generic_header() -> None:
+    headers = {"x-original-host": "api.githubcopilot.com"}
+    assert (
+        copilot_auth.resolve_copilot_proxy_upstream_base(headers)
+        == "https://api.githubcopilot.com"
+    )
+
+
 def test_should_exchange_oauth_token_supports_truthy_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

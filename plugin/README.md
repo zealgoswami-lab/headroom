@@ -26,6 +26,7 @@ This integration requires **three pieces working together**:
 - [VS Code settings explained](#vs-code-settings-explained)
 - [Starting the Headroom proxy](#starting-the-headroom-proxy)
 - [Enterprise and plan support](#enterprise-and-plan-support)
+- [Enterprise Copilot test kit](#enterprise-copilot-test-kit)
 - [Windows notes](#windows-notes)
 - [WSL notes](#wsl-notes)
 - [Verification and testing](#verification-and-testing)
@@ -38,7 +39,7 @@ This integration requires **three pieces working together**:
 
 ## Architecture
 
-Copilot Chat normally calls `https://api.githubcopilot.com` (or a plan-specific host). The patched extension instead sends OpenAI-compatible requests to Headroom on localhost. Headroom compresses prompts and tool context, then forwards the request upstream. The extension sets `X-Original-Host` so Headroom knows which Copilot API hostname to use — without that header, traffic would hit the wrong upstream or be rejected.
+Copilot Chat normally calls `https://api.business.githubcopilot.com` by default (or another plan-specific host when the client sends `X-Original-Host`). The patched extension instead sends OpenAI-compatible requests to Headroom on localhost. Headroom compresses prompts and tool context, then forwards the request upstream. The extension sets `X-Original-Host` so Headroom knows which Copilot API hostname to use — without that header, traffic would hit the wrong upstream or be rejected.
 
 ```mermaid
 sequenceDiagram
@@ -46,9 +47,9 @@ sequenceDiagram
     participant HR as Headroom proxy<br/>localhost:8787
     participant CP as GitHub Copilot API<br/>api.*.githubcopilot.com
 
-    VS->>HR: POST /v1/chat/completions<br/>X-Original-Host: api.githubcopilot.com<br/>Authorization: Bearer …
+    VS->>HR: POST /v1/chat/completions<br/>X-Original-Host: api.business.githubcopilot.com<br/>Authorization: Bearer …
     Note over HR: Compress context · CCR cache · auth passthrough
-    HR->>CP: POST https://api.githubcopilot.com/…<br/>(compressed body)
+    HR->>CP: POST https://api.business.githubcopilot.com/…<br/>(compressed body; Business by default)
     CP-->>HR: SSE / JSON response
     HR-->>VS: Response (tokens saved logged in /stats)
 ```
@@ -61,10 +62,11 @@ ASCII equivalent:
 │  patched Copilot    │ ─────────────────────────────────►│  (compress + CCR)    │
 │  Chat extension     │                                   └──────────┬───────────┘
 └─────────────────────┘                                              │
-                                                                     │ https://api.*.githubcopilot.com
+                                                                     │ https://api.business.githubcopilot.com
                                                                      ▼
                                                           ┌──────────────────────┐
                                                           │  GitHub Copilot API  │
+                                                          │  (Business default)  │
                                                           └──────────────────────┘
 ```
 
@@ -72,9 +74,9 @@ The `X-Original-Host` allowlist in `headroom/providers/proxy_routes.py` is inten
 
 | Host | Typical use |
 |------|-------------|
-| `api.githubcopilot.com` | Default (Business / mixed plans) |
+| `api.business.githubcopilot.com` | Default upstream when no `X-Original-Host` / env override (Business) |
+| `api.githubcopilot.com` | Legacy generic host (still accepted via `X-Original-Host`) |
 | `api.individual.githubcopilot.com` | Individual Copilot subscription |
-| `api.business.githubcopilot.com` | GitHub Enterprise Cloud (GHEC) — business SKU |
 | `api.enterprise.githubcopilot.com` | GHEC — enterprise SKU |
 | `api-model-lab.githubcopilot.com` | Model lab / preview endpoints |
 
@@ -154,6 +156,7 @@ This integration uses a local proxy because it is the only reliable way to apply
 ### 1. Start the Headroom proxy
 
 ```bash
+# Defaults to Business upstream (api.business.githubcopilot.com) when unset
 headroom proxy --port 8787
 ```
 
@@ -163,12 +166,15 @@ Or with Docker (default compose — starts Qdrant/Neo4j dependencies):
 docker compose up headroom-proxy
 ```
 
+For a Copilot-pinned compose overlay, see [Docker — Copilot overlay](#docker--copilot-overlay).
+
 Verify:
 
 ```bash
 curl http://localhost:8787/readyz
 ```
 
+`checks.upstream.url` should be a Copilot host (Business by default), not Anthropic.
 ### 2. Install the patched Copilot Chat VSIX
 
 From the repository root:
@@ -273,6 +279,7 @@ If you use workspace settings, apply the same keys there or ensure user settings
 
 ```bash
 pip install "headroom-ai[proxy]"
+# Business host is the default when GITHUB_COPILOT_API_URL is unset
 headroom proxy --port 8787
 ```
 
@@ -282,6 +289,7 @@ The patched VS Code extension forwards the Copilot session `Authorization` heade
 
 ```bash
 export GITHUB_TOKEN=$(gh auth token)   # optional but recommended
+# export GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com  # default
 headroom proxy --port 8787
 ```
 
@@ -295,19 +303,21 @@ Binds `8787:8787`, runs health checks against `/readyz`, persists workspace data
 
 ### Docker — Copilot overlay
 
-Use [`docker-compose.copilot.yml`](../docker-compose.copilot.yml) when you want the container's OpenAI-compatible upstream pinned to GitHub Copilot:
+Use [`docker-compose.copilot.yml`](../docker-compose.copilot.yml) when you want the container's OpenAI-compatible upstream pinned to GitHub Copilot (Business by default):
 
 ```bash
 export GITHUB_TOKEN=$(gh auth token)
+# optional override — Business is the default when unset
+# export GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com
 docker compose -f docker-compose.yml -f docker-compose.copilot.yml up headroom-proxy
 ```
 
 The overlay sets:
 
-- `OPENAI_TARGET_API_URL=https://api.githubcopilot.com`
+- `OPENAI_TARGET_API_URL=https://api.business.githubcopilot.com`
 - `GITHUB_TOKEN=${GITHUB_TOKEN}`
 
-Pair this with the VS Code settings above. `GITHUB_TOKEN` should be a token with Copilot access ( `gh auth token` after `gh auth login` is the usual path).
+Pair this with the VS Code settings above. `GITHUB_TOKEN` should be a token with Copilot access (`gh auth token` after `gh auth login` is the usual path).
 
 ---
 
@@ -316,11 +326,57 @@ Pair this with the VS Code settings above. `GITHUB_TOKEN` should be a token with
 | Deployment | Supported via this integration | Notes |
 |------------|-------------------------------|-------|
 | **GitHub.com — Individual** | Yes | Extension sends `X-Original-Host: api.individual.githubcopilot.com` when applicable. |
-| **GitHub.com — Business / Pro+** | Yes | Default `api.githubcopilot.com`. |
+| **GitHub.com — Business / Pro+** | Yes | Default `api.business.githubcopilot.com`; extension may still send `api.githubcopilot.com` via `X-Original-Host`. |
 | **GHEC** (GitHub Enterprise Cloud) | Yes | `api.business.githubcopilot.com` or `api.enterprise.githubcopilot.com` via `X-Original-Host`. Sign in with your enterprise account in VS Code. |
 | **GHES** (GitHub Enterprise Server, self-hosted) | Yes | Extension sends `X-Original-Host: copilot-api.<tenant>.ghe.com` (hosted GHES) or `copilot-api.<your-domain>` for custom domains. Set `GITHUB_COPILOT_ENTERPRISE_DOMAIN=<your-domain>` (or `GITHUB_COPILOT_API_URL=https://copilot-api.<your-domain>`) on the proxy so custom hostnames are trusted. |
 
 Headroom's separate `headroom wrap copilot --subscription` path (Copilot CLI) uses the same enterprise env vars (`GITHUB_COPILOT_ENTERPRISE_DOMAIN`, `GITHUB_COPILOT_API_URL`).
+
+Override the upstream host on the proxy when needed:
+
+```bash
+export GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com   # default
+# export GITHUB_COPILOT_API_URL=https://api.individual.githubcopilot.com
+# export GITHUB_COPILOT_API_URL=https://api.enterprise.githubcopilot.com
+headroom proxy --port 8787
+```
+
+---
+
+## Enterprise Copilot test kit
+
+Premium-model failures (`400 "The requested model is not supported"`) are often an **upstream entitlement / org-policy gate**, not a Headroom bug. Use the secret-free kit in this repo to tell them apart before filing issues.
+
+Full runbook: [`tools/copilot-test/ENTERPRISE-COPILOT-TEST.md`](../tools/copilot-test/ENTERPRISE-COPILOT-TEST.md).
+
+Run from the repo root, with the Copilot CLI logged in on the same machine:
+
+```bash
+# A — credential discovery, catalog, native inference (no Headroom in the path)
+GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com \
+  .venv/bin/python tools/copilot-test/copilot_doctor.py
+
+# B — same checks through a real Headroom proxy
+GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com \
+  .venv/bin/python tools/copilot-test/enterprise_proxy_test.py
+```
+
+**Windows PowerShell:**
+
+```powershell
+$env:GITHUB_COPILOT_API_URL = "https://api.business.githubcopilot.com"
+.venv\Scripts\python.exe tools\copilot-test\copilot_doctor.py
+.venv\Scripts\python.exe tools\copilot-test\enterprise_proxy_test.py
+```
+
+| Doctor (native) | Harness (through proxy) | Conclusion |
+|---|---|---|
+| premium ✅ | premium ✅ | Copilot Business works through Headroom |
+| premium ✅ | premium ❌ | Likely a Headroom routing / wire-API bug |
+| premium ❌ (`400`) | premium ❌ | Org policy / entitlement — enable models in Copilot settings |
+| `🔒 403` anywhere | — | SSO authorization needed — re-auth via IdP |
+
+Output is secret-free (token type prefix + length only). Paste stdout back when reporting issues.
 
 ---
 
@@ -334,6 +390,7 @@ Headroom's separate `headroom wrap copilot --subscription` path (Copilot CLI) us
 - **Reload the window** after every VSIX install or upgrade.
 - **Firewall:** allow local loopback to port `8787`. Remote machines cannot reach `localhost` — run the proxy on the same host as VS Code (or use explicit port forwarding).
 - **Auto-update:** confirm `extensions.autoUpdate` is off in **User** settings, not only Workspace — marketplace updates have reverted patched installs in the field.
+- **Premium models:** if Claude / GPT‑5 fail with “not supported”, run the [Enterprise Copilot test kit](#enterprise-copilot-test-kit) before assuming a routing bug.
 
 ---
 
@@ -452,7 +509,7 @@ headroom proxy --port 8787
    $env:HEADROOM_LOG_LEVEL = "DEBUG"
    headroom proxy --port 8787
    ```
-4. **Success:** logs show a forwarded request with `X-Original-Host` set to an allowed `api.*.githubcopilot.com` host, and no `Rejected X-Original-Host` warning.
+4. **Success:** logs show a forwarded request with `X-Original-Host` set to an allowed Copilot host (often `api.business.githubcopilot.com`), and no `Rejected X-Original-Host` warning.
 5. **Failure:** chat works but proxy logs stay empty — you are likely on stock Copilot Chat; repeat the CLI and UI checks above.
 
 Optional confirmation of compression:
@@ -495,7 +552,7 @@ Expected output (trimmed):
   "checks": {
     "upstream": {
       "status": "ok",
-      "url": "https://api.githubcopilot.com"
+      "url": "https://api.business.githubcopilot.com"
     }
   }
 }
@@ -511,7 +568,7 @@ Verify these fields:
 
 Values like `timestamp`, `uptime_seconds`, and runtime counters vary by environment and request timing.
 
-For Copilot users, `checks.upstream.url` should point to a Copilot host (for example `api.individual.githubcopilot.com`, `api.business.githubcopilot.com`, or `api.enterprise.githubcopilot.com`) — not `api.anthropic.com`.
+For Copilot users, `checks.upstream.url` should point to a Copilot host (for example `api.business.githubcopilot.com`, `api.individual.githubcopilot.com`, or `api.enterprise.githubcopilot.com`) — not `api.anthropic.com`. When no `X-Original-Host` or `GITHUB_COPILOT_API_URL` is set, Headroom defaults to the Business endpoint.
 
 If the upstream URL is wrong, restart the proxy with `OPENAI_TARGET_API_URL` set to your Copilot endpoint.
 
@@ -523,9 +580,19 @@ If the upstream URL is wrong, restart the proxy with `OPENAI_TARGET_API_URL` set
    ```bash
    HEADROOM_LOG_LEVEL=DEBUG headroom proxy --port 8787
    ```
-   Look for upstream routing to `https://api.*.githubcopilot.com` and no `Rejected X-Original-Host` warnings.
+   Look for upstream routing to `https://api.business.githubcopilot.com` (or another allowed `api.*.githubcopilot.com` host selected via `X-Original-Host`) and no `Rejected X-Original-Host` warnings.
 
-### 4. Token savings
+### 4. Premium models / Copilot Business entitlement
+
+If Claude, GPT‑5, or other premium models return `400 "not supported"` in Chat:
+
+1. Run the [Enterprise Copilot test kit](#enterprise-copilot-test-kit) (`copilot_doctor.py` then `enterprise_proxy_test.py`).
+2. Use the decision matrix there — native ❌ + proxy ❌ means org policy/entitlement; native ✅ + proxy ❌ means a Headroom bug.
+3. Do not treat a catalog limited to `gpt-4o` as a VSIX install failure by itself.
+
+Full steps: [`tools/copilot-test/ENTERPRISE-COPILOT-TEST.md`](../tools/copilot-test/ENTERPRISE-COPILOT-TEST.md).
+
+### 5. Token savings
 
 ```bash
 curl -s http://localhost:8787/stats | jq '.savings // .'
@@ -573,19 +640,19 @@ curl -s http://localhost:8787/stats | jq '.tokens | {proxy_received_tokens, prox
 
 Legacy fields (`saved`, `proxy_compression_saved`, `savings_percent`) remain unchanged for older dashboards.
 
-### 5. Manual header check (optional)
+### 6. Manual header check (optional)
 
 If you need to confirm allowlist behavior without VS Code:
 
 ```bash
 curl -s -X POST http://localhost:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Original-Host: api.githubcopilot.com" \
+  -H "X-Original-Host: api.business.githubcopilot.com" \
   -H "Authorization: Bearer YOUR_COPILOT_TOKEN" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"ping"}]}'
 ```
 
-A `401` with routing metadata still proves the proxy accepted `X-Original-Host`; a `200` proves full auth. Use a real Copilot session token from your environment — do not commit tokens.
+A `401` with routing metadata still proves the proxy accepted `X-Original-Host`; a `200` proves full auth. Use a real Copilot session token from your environment — do not commit tokens. For a Business-host matrix across premium models, prefer the [Enterprise Copilot test kit](#enterprise-copilot-test-kit) instead of crafting curls by hand.
 
 ---
 
@@ -600,7 +667,8 @@ A `401` with routing metadata still proves the proxy accepted `X-Original-Host`;
 | **Extension version downgrade blocked** | VSIX older than installed Copilot Chat | Use `--force`; if VS Code refuses, uninstall Copilot Chat first, then install the VSIX. |
 | **Extension reverted after VS Code restart** | `extensions.autoUpdate` re-enabled | Set both `extensions.autoUpdate` and `extensions.autoCheckUpdates` to off; reload window. |
 | **Chat works on host, fails in WSL** | `localhost` mismatch | See WSL notes — align proxy host with VS Code's network namespace. |
-| **Copilot quota / plan errors** | Business vs individual endpoint | Ensure enterprise sign-in; check logs for which `api.*.githubcopilot.com` host was selected. |
+| **Copilot quota / plan errors** | Business vs individual endpoint | Ensure enterprise sign-in; check logs for which `api.*.githubcopilot.com` host was selected. Default without override is Business (`api.business.githubcopilot.com`). |
+| **Premium model `400 not supported`** | Org policy / entitlement, or Headroom routing | Run the [Enterprise Copilot test kit](#enterprise-copilot-test-kit). Native and proxy both ❌ → enable models in Copilot org policies. Native ✅ / proxy ❌ → Headroom bug. |
 
 ---
 
@@ -641,7 +709,8 @@ After upstream Copilot Chat changes, the fork maintainer may need to merge Micro
 
 | Tool | Integration |
 |------|-------------|
-| **Copilot CLI** | `headroom wrap copilot` / `headroom wrap copilot --subscription` — no VSIX required |
+| **Copilot CLI** | `headroom wrap copilot` / `headroom wrap copilot --subscription` — no VSIX required; default upstream is Business |
+| **Copilot Business test kit** | [`tools/copilot-test/`](../tools/copilot-test/) — `copilot_doctor.py` + `enterprise_proxy_test.py`; see [Enterprise Copilot test kit](#enterprise-copilot-test-kit) |
 | **Cursor** | Set OpenAI base URL to `http://localhost:8787` |
 | **Claude Code** | `headroom wrap claude` |
 

@@ -94,7 +94,7 @@ unset HEADROOM_COPILOT_DEBUG_OUTBOUND          # stop outbound capture
 
 ---
 
-### Kit contents (currently uncommitted)
+### Kit contents
 - `tools/copilot-test/copilot_doctor.py` — Phase A, read-only diagnostic
 - `tools/copilot-test/enterprise_proxy_test.py` — Phase B, live-proxy through-path
 - Outbound capture hook lives in `headroom/copilot_auth.py` (env-gated `HEADROOM_COPILOT_DEBUG_OUTBOUND`)

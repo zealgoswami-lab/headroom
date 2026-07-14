@@ -214,7 +214,9 @@ Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilo
 
 ### GitHub Copilot CLI subscription mode
 
-Headroom can route GitHub Copilot CLI subscription traffic through the local proxy:
+Headroom can route GitHub Copilot CLI subscription traffic through the local proxy.
+Unless you override it, the default upstream is the **Business** host
+(`https://api.business.githubcopilot.com`).
 
 ```bash
 headroom copilot-auth login
@@ -228,6 +230,15 @@ This avoids relying on generic GitHub or Copilot CLI tokens that can read
 Copilot account metadata but may still be rejected by Copilot's token-exchange
 endpoint.
 
+Override the upstream host when needed:
+
+```bash
+# Business (default) / Individual / Enterprise / custom
+export GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com
+# export GITHUB_COPILOT_API_URL=https://api.individual.githubcopilot.com
+# export GITHUB_COPILOT_API_URL=https://api.enterprise.githubcopilot.com
+```
+
 For GitHub Enterprise Server or custom-domain Copilot deployments, set the
 deployment domain before launching:
 
@@ -237,8 +248,27 @@ export GITHUB_COPILOT_ENTERPRISE_DOMAIN=ghe.example.com
 
 For GitHub.com Enterprise Cloud URLs such as
 `github.com/enterprises/your-enterprise`, do not set an enterprise-domain
-override. Headroom uses GitHub's normal token-exchange endpoint and the Copilot
-API endpoint advertised for the signed-in account.
+override unless you also need a custom API host. Headroom's default routing
+target is the Business host; clients can still select another allowed host via
+`X-Original-Host` or `GITHUB_COPILOT_API_URL`.
+
+#### Verify Copilot Business / premium models
+
+Premium-model failures are often an upstream entitlement/org-policy gate, not a
+Headroom bug. Use the secret-free enterprise test kit to tell them apart:
+
+```bash
+# A — credential discovery, catalog, native inference
+GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com \
+  .venv/bin/python tools/copilot-test/copilot_doctor.py
+
+# B — same checks through a real Headroom proxy
+GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com \
+  .venv/bin/python tools/copilot-test/enterprise_proxy_test.py
+```
+
+Full provisioning steps and decision matrix:
+[`tools/copilot-test/ENTERPRISE-COPILOT-TEST.md`](tools/copilot-test/ENTERPRISE-COPILOT-TEST.md).
 
 Platform support note: macOS auth reuse via Copilot CLI Keychain storage has been smoke-tested. Windows Credential Manager, Linux Secret Service / `secret-tool`, and Docker/CI token-injection paths are implemented or planned as auth-discovery paths, but still need real OS validation before they should be considered fully vetted. For Docker and CI, prefer passing an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` rather than relying on host keychain access.
 
