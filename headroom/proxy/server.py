@@ -34,10 +34,11 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     from ..backends.base import Backend
@@ -447,6 +448,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("headroom.proxy")
 
+LoopExceptionHandler = Callable[[asyncio.AbstractEventLoop, dict[str, Any]], object]
+
+
+class LoopFailureDetails(TypedDict):
+    message: Any | None
+    exception: str | None
+
+
+class LoopHealthState(TypedDict):
+    status: str
+    known_failures: int
+    last_known_failure: LoopFailureDetails | None
+
+
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
@@ -583,6 +598,29 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     get_toin(TOINConfig(storage_path=""))
 
 
+def _provider_httpx_client_options(
+    config: ProxyConfig,
+    verify: Any,
+) -> tuple[bool, dict[str, Any]]:
+    client_kwargs: dict[str, Any] = {
+        "timeout": httpx.Timeout(
+            connect=config.connect_timeout_seconds,
+            read=config.request_timeout_seconds,
+            write=config.request_timeout_seconds,
+            pool=config.connect_timeout_seconds,
+        ),
+        "limits": httpx.Limits(
+            max_connections=config.max_connections,
+            max_keepalive_connections=config.max_keepalive_connections,
+            keepalive_expiry=config.keepalive_expiry,
+        ),
+        "verify": verify,
+    }
+    if config.http_proxy:
+        client_kwargs["proxy"] = config.http_proxy
+    return config.http2 and not config.http_proxy, client_kwargs
+
+
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
@@ -663,6 +701,7 @@ class HeadroomProxy(
         profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
+            prefer_code_aware_for_code=_get_env_bool("HEADROOM_PREFER_CODE_AWARE_FOR_CODE", True),
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
             smart_crusher_max_items_after_crush=cast(
@@ -838,6 +877,7 @@ class HeadroomProxy(
         # HTTP/1.1-only client for ChatGPT passthrough (Cloudflare challenges
         # our HTTP/2 fingerprint on its sensitive account endpoints).
         self.http_client_h1: httpx.AsyncClient | None = None
+        self._shutdown_event: asyncio.Event | None = None
 
         # Shared cold-start warmup registry (populated by startup()).
         # Holds typed slots with loaded / loading / null / error status for
@@ -892,7 +932,7 @@ class HeadroomProxy(
         #      are sitting on stuck work.
         _compression_max_cfg = config.compression_max_workers
         if _compression_max_cfg is None:
-            _compression_max = min(32, (os.cpu_count() or 1) * 4)
+            _compression_max = max(1, os.cpu_count() or 1)
         else:
             _compression_max = max(1, _compression_max_cfg)
         self.compression_max_workers: int = _compression_max
@@ -1349,6 +1389,7 @@ class HeadroomProxy(
 
     async def startup(self):
         """Initialize async resources."""
+        self._get_shutdown_event().clear()
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -1358,29 +1399,14 @@ class HeadroomProxy(
         # is configured, else a strict-relaxed default context when
         # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
         _verify = build_httpx_verify()
-        _client_kwargs: dict[str, Any] = {
-            "timeout": httpx.Timeout(
-                connect=self.config.connect_timeout_seconds,
-                read=self.config.request_timeout_seconds,
-                write=self.config.request_timeout_seconds,
-                pool=self.config.connect_timeout_seconds,
-            ),
-            "limits": httpx.Limits(
-                max_connections=self.config.max_connections,
-                max_keepalive_connections=self.config.max_keepalive_connections,
-                keepalive_expiry=self.config.keepalive_expiry,
-            ),
-            "verify": _verify,
-        }
-        self.http_client = httpx.AsyncClient(http2=self.config.http2, **_client_kwargs)
+        _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
+        self.http_client = httpx.AsyncClient(http2=_http2, **_client_kwargs)
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
-            self.http_client
-            if not self.config.http2
-            else httpx.AsyncClient(http2=False, **_client_kwargs)
+            self.http_client if not _http2 else httpx.AsyncClient(http2=False, **_client_kwargs)
         )
-        logger.info("Headroom Proxy started")
+        logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
         self.config.mode = normalize_proxy_mode(self.config.mode)
         logger.info(f"Mode: {self.config.mode}")
@@ -1397,7 +1423,7 @@ class HeadroomProxy(
         logger.info(
             f"Connection Pool: max_connections={self.config.max_connections}, "
             f"max_keepalive={self.config.max_keepalive_connections}, "
-            f"http2={'ENABLED' if self.config.http2 else 'DISABLED'}"
+            f"http2={'ENABLED' if _http2 else 'DISABLED'}"
         )
 
         # Unit 4 pre-upstream concurrency announcement. Report the resolved
@@ -1605,6 +1631,7 @@ class HeadroomProxy(
 
     async def shutdown(self):
         """Cleanup async resources."""
+        self._get_shutdown_event().set()
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -1626,6 +1653,11 @@ class HeadroomProxy(
 
         # Stop all quota trackers via the registry
         await get_quota_registry().stop_all()
+
+        # Persist any savings the tracker's write throttle is still holding, so
+        # a graceful shutdown doesn't drop the last few requests' totals.
+        with contextlib.suppress(Exception):
+            self.metrics.savings_tracker.flush()
 
         # Print final stats
         self._print_summary()
@@ -1699,6 +1731,33 @@ class HeadroomProxy(
         from headroom.proxy.helpers import extract_tags
 
         return extract_tags(headers)
+
+    def _get_shutdown_event(self) -> asyncio.Event:
+        event = getattr(self, "_shutdown_event", None)
+        if event is None:
+            event = asyncio.Event()
+            self._shutdown_event = event
+        return event
+
+    async def _wait_for_retry_delay_or_shutdown(self, delay_seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._get_shutdown_event().wait(), timeout=delay_seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def _shutdown_retry_response(self, method: str, url: str) -> httpx.Response:
+        return httpx.Response(
+            503,
+            request=httpx.Request(method, url),
+            headers={"content-type": "application/json", "retry-after": "0"},
+            json={
+                "error": {
+                    "type": "shutdown",
+                    "message": "Proxy is shutting down; retry backoff cancelled.",
+                }
+            },
+        )
 
     async def _retry_request(
         self,
@@ -1795,7 +1854,13 @@ class HeadroomProxy(
                             f"Upstream {response.status_code} (attempt {attempt + 1}), "
                             f"retrying in {delay_ms:.0f}ms"
                         )
-                        await asyncio.sleep(delay_ms / 1000)
+                        if await self._wait_for_retry_delay_or_shutdown(delay_ms / 1000):
+                            logger.info(
+                                "Shutdown interrupted retry backoff for %s %s",
+                                method,
+                                path_for_log or "<upstream-url>",
+                            )
+                            return self._shutdown_retry_response(method, url)
                         continue
 
                     # Don't retry other client errors (4xx)
@@ -1812,10 +1877,25 @@ class HeadroomProxy(
 
                     return response
 
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            # httpx.TransportError covers ConnectError, the timeout family, and —
+            # crucially — the protocol errors (Local/RemoteProtocolError, e.g. an
+            # HTTP/2 `StreamReset`) that a poisoned shared h2 connection raises on
+            # every in-flight request. Retrying drops the bad connection and
+            # re-sends on a fresh one instead of collapsing to a 502. (#1639)
+            except (httpx.TransportError, httpx.HTTPStatusError) as e:
                 last_error = e
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
+                    # On exhaustion, preserve the upstream 5xx status (e.g. 503
+                    # Service Unavailable, 500, 502, 504) so the client can apply
+                    # its own retry/backoff. Collapsing every exhausted 5xx into a
+                    # generic 502 hides the retryable signal and makes clients give
+                    # up. The 429/529 overload statuses are already returned
+                    # verbatim by the RETRYABLE_OVERLOAD_STATUSES branch above and
+                    # never reach here. ConnectError/TimeoutException carry no
+                    # response, so those still raise.
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        return e.response
                     raise
 
                 # Exponential backoff with jitter
@@ -1828,7 +1908,13 @@ class HeadroomProxy(
                 logger.warning(
                     f"Request failed (attempt {attempt + 1}), retrying in {delay_with_jitter:.0f}ms: {e}"
                 )
-                await asyncio.sleep(delay_with_jitter / 1000)
+                if await self._wait_for_retry_delay_or_shutdown(delay_with_jitter / 1000):
+                    logger.info(
+                        "Shutdown interrupted retry backoff for %s %s",
+                        method,
+                        path_for_log or "<upstream-url>",
+                    )
+                    return self._shutdown_retry_response(method, url)
 
         if last_error is None:
             raise RuntimeError(
@@ -1921,6 +2007,38 @@ def _request_is_loopback(request: Request) -> bool:
     except AttributeError:
         host_header = None
     return is_loopback_host(client_host) and is_loopback_host_header(host_header)
+
+
+def _is_known_websocket_callback_failure(context: dict[str, Any]) -> bool:
+    """Return True iff this exact websockets callback failure shape is observed."""
+    if (
+        context.get("message")
+        != "Exception in callback Connection.connection_lost(ConnectionResetError())"
+    ):
+        return False
+    exception = context.get("exception")
+    return (
+        isinstance(exception, AttributeError)
+        and str(exception) == "'ClientConnection' object has no attribute 'recv_messages'"
+    )
+
+
+def _tool_schema_saved_from_tags(tags: object) -> int:
+    """Tool-definition tokens Headroom kept out of context for one request by
+    deferring heavy tool schemas: the native tool-search injection
+    (``tool_search_deferred_tokens``) plus any registered turn-hook tools
+    rewrite (``turn_hook_tools_saved_tokens``). Both tags are set only on the
+    path where Headroom performed the deferral, so a client that already had
+    tool search enabled (e.g. Claude Code / Codex) contributes zero here."""
+    if not isinstance(tags, dict):
+        return 0
+    total = 0
+    for key in ("tool_search_deferred_tokens", "turn_hook_tools_saved_tokens"):
+        try:
+            total += int(tags.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
@@ -2052,6 +2170,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         try:
             try:
+                previous_handler = _install_loop_exception_handler()
                 # Startup
                 await proxy.startup()
                 if config.periodic_toin_stats_enabled:
@@ -2080,6 +2199,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 app.state.startup_error = str(exc)
                 raise
         finally:
+            loop: asyncio.AbstractEventLoop | None
+            previous: LoopExceptionHandler | None
+            try:
+                loop = asyncio.get_running_loop()
+                previous = previous_handler
+            except RuntimeError:
+                loop = None
+                previous = app.state.previous_loop_exception_handler
+            if loop is not None:
+                loop.set_exception_handler(previous)
+
             app.state.ready = False
             # Shutdown
             if _cc_reconciler is not None:
@@ -2105,10 +2235,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    loop_health_state: LoopHealthState = {
+        "status": "healthy",
+        "known_failures": 0,
+        "last_known_failure": None,
+    }
     app.state.proxy = proxy
     app.state.started_at = None
     app.state.ready = False
     app.state.startup_error = None
+    app.state.loop_callback_health = loop_health_state
+    app.state.loop_exception_handler = None
+    app.state.previous_loop_exception_handler = None
     # Set by the lifespan startup smoke test (`_check_rust_core`). Default
     # "missing" means lifespan hasn't run yet — anything reading /health
     # before startup completes (rare; lifespan runs before the first
@@ -2240,6 +2378,46 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "active_relay_tasks": ws_active_relay_tasks,
             },
         }
+
+    def _loop_callback_payload() -> LoopHealthState:
+        return {
+            "status": loop_health_state["status"],
+            "known_failures": loop_health_state["known_failures"],
+            "last_known_failure": loop_health_state["last_known_failure"],
+        }
+
+    def _install_loop_exception_handler() -> LoopExceptionHandler | None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+        previous_handler = loop.get_exception_handler()
+
+        def _loop_exception_handler(
+            _loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+        ) -> None:
+            if _is_known_websocket_callback_failure(context):
+                loop_health_state["status"] = "unhealthy"
+                loop_health_state["known_failures"] += 1
+                loop_health_state["last_known_failure"] = {
+                    "message": context.get("message"),
+                    "exception": str(context.get("exception"))
+                    if context.get("exception")
+                    else None,
+                }
+                return
+
+            delegate_handler = app.state.previous_loop_exception_handler
+            if delegate_handler is not None:
+                delegate_handler(_loop, context)
+                return
+            _loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_loop_exception_handler)
+        app.state.loop_exception_handler = _loop_exception_handler
+        app.state.previous_loop_exception_handler = previous_handler
+        return previous_handler
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
@@ -2631,15 +2809,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Health & Metrics
     @app.get("/livez")
     async def livez():
+        callback_state = _loop_callback_payload()
+        healthy = callback_state["status"] == "healthy"
         return JSONResponse(
-            status_code=200,
+            status_code=200 if healthy else 503,
             content={
                 "service": "headroom-proxy",
-                "status": "healthy",
-                "alive": True,
+                "status": "healthy" if healthy else "unhealthy",
+                "alive": healthy,
                 "version": __version__,
                 "timestamp": _iso_utc_now(),
                 "uptime_seconds": _uptime_seconds(),
+                "loop_health": callback_state,
             },
         )
 
@@ -2758,6 +2939,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
 
+    @app.get("/favicon.ico")
+    async def favicon() -> Response:
+        # Registered before register_provider_routes' catch-all passthrough
+        # route so browsers' automatic favicon requests for /dashboard are
+        # answered locally instead of being tunneled to the wrapped upstream
+        # provider (GH #1787).
+        return Response(status_code=204)
+
     DASHBOARD_STATS_CACHE_TTL_SECONDS = 5.0
     _stats_snapshot_lock = asyncio.Lock()
     _stats_snapshot: dict[str, Any] = {"expires_at": 0.0, "value": None}
@@ -2785,6 +2974,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "total_latency_ms": log.get("total_latency_ms"),
                 "transforms_applied": log.get("transforms_applied", []),
                 "waste_signals": log.get("waste_signals"),
+                "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
             }
             for log in recent_request_logs
             if log.get("input_tokens_original") is not None
@@ -2896,6 +3086,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         rtk_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "rtk" else 0
         lean_ctx_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "lean-ctx" else 0
+        cli_filtering_available = bool(
+            cli_filtering_stats and cli_filtering_stats.get("installed", False)
+        )
 
         # Calculate total tokens before Headroom-side reduction. Proxy
         # compression and the configured context tool both remove tokens before
@@ -2966,6 +3159,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         display_session = persistent_savings.get("display_session", {})
         recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
         recent_request_payload = _build_recent_request_payload()
+
+        # Tool-schema deferral savings: tool-definition tokens kept out of the
+        # model's context by deferring heavy schemas until they're needed
+        # (native tool-search injection + any registered turn-hook tools
+        # rewrite). Attributed to Headroom only — see _tool_schema_saved_from_tags.
+        # Aggregated over the recent request-log window.
+        tool_schema_tokens = 0
+        tool_schema_requests = 0
+        for _ts_log in recent_request_logs:
+            _ts_saved = _tool_schema_saved_from_tags(_ts_log.get("tags"))
+            if _ts_saved > 0:
+                tool_schema_tokens += _ts_saved
+                tool_schema_requests += 1
         agent_usage = _build_agent_usage_summary(
             recent_request_logs,
             requests_by_provider=dict(m.requests_by_provider),
@@ -3024,6 +3230,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "cli_filtering": {
                         "tool": cli_filtering_tool,
                         "label": cli_filtering_label,
+                        "available": cli_filtering_available,
                         "tokens": cli_tokens_avoided,
                         "tokens_saved": cli_tokens_avoided,
                         "session": cli_filtering_session,
@@ -3098,6 +3305,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                             "steered verbosity / routed effort down. Counterfactual — "
                             "shown as an estimate (vs a learned baseline) or measured "
                             "(A/B holdout), always with a confidence band."
+                        ),
+                    },
+                    "tool_search": {
+                        "tokens": tool_schema_tokens,
+                        "tokens_saved": tool_schema_tokens,
+                        "requests": tool_schema_requests,
+                        "window": len(recent_request_logs),
+                        "description": (
+                            "Tool-definition tokens kept out of the model's context "
+                            "by deferring heavy tool schemas until they're searched "
+                            "for. Counted only when Headroom performed the deferral — "
+                            "not when the client (e.g. Claude Code / Codex) already "
+                            "had tool search enabled. Aggregated over the recent "
+                            "request window."
                         ),
                     },
                 },
@@ -3329,9 +3550,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "context_tool": {
                 "configured": cli_filtering_tool,
                 "label": cli_filtering_label,
-                "available": bool(
-                    cli_filtering_stats and cli_filtering_stats.get("installed", False)
-                ),
+                "available": cli_filtering_available,
                 "stats": cli_filtering_stats,
             },
             "cli_filtering": cli_filtering_stats,
@@ -3453,11 +3672,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """Get durable proxy compression history plus display-session state.
 
         The JSON payload also carries a ``cli_filtering`` key with live RTK
-        stats. This is a curated subset (``tool``, ``label``, ``lifetime``,
-        ``session``) tailored to the Historical tab, not the full
-        ``_get_context_tool_stats()`` payload that ``/stats`` exposes. It is
-        ``None`` when RTK is absent or its stats cannot be read, so the tab
-        simply hides the card rather than erroring.
+        stats. This is a curated subset (``tool``, ``label``, ``available``,
+        ``lifetime``, ``session``) tailored to the Historical tab, not the
+        full ``_get_context_tool_stats()`` payload that ``/stats`` exposes.
+        It is ``None`` only when the stats read hard-fails; when the tool is
+        merely absent, ``cli_filtering`` stays populated with
+        ``available: False`` and zeroed counters so the tab can distinguish
+        "not installed" from "installed, no data yet."
         """
         if format == "csv":
             filename = f"headroom-stats-history-{series}.csv"
@@ -3484,6 +3705,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             history["cli_filtering"] = {
                 "tool": str(cli_stats.get("tool", "rtk")),
                 "label": str(cli_stats.get("label", "RTK")),
+                "available": bool(cli_stats.get("installed", False)),
                 "lifetime": cli_stats.get("lifetime", {}),
                 "session": cli_stats.get("session", {}),
             }
@@ -4149,10 +4371,17 @@ def _proxy_config_from_env() -> ProxyConfig:
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
         http2=_get_env_bool("HEADROOM_HTTP2", True),
+        http_proxy=os.environ.get("HEADROOM_HTTP_PROXY") or None,
         periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
         offline=_get_env_bool("HEADROOM_OFFLINE", False),
-        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        # Default mode is CACHE (Headroom's coding posture): delta-only compression
+        # at ~0 prefix-cache busts. HEADROOM_MODE overrides.
+        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
+        # Default savings profile is "coding" so proxy_pipeline_kwargs applies its
+        # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
+        # overrides.
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
@@ -4163,6 +4392,12 @@ def _proxy_config_from_env() -> ProxyConfig:
 
 
 def create_app_from_env() -> FastAPI:
+    # Seed the coding-profile defaults into the process env BEFORE reading config,
+    # so the uvicorn factory launch gets Headroom's out-of-box posture (cache mode,
+    # tool-search, dedupe, read protection, …). setdefault → explicit env wins.
+    from headroom.agent_savings import seed_proxy_env_defaults
+
+    seed_proxy_env_defaults()
     return create_app(_proxy_config_from_env())
 
 
@@ -4201,12 +4436,22 @@ def run_server(
         print("ERROR: FastAPI required. Install: pip install fastapi uvicorn httpx")
         sys.exit(1)
 
+    # Seed the request-time coding-profile toggles (tool-search, dedupe, read
+    # protection, lossless→lossy, effort-router, block-char floor) into the
+    # process env before serving, so downstream per-request readers pick them up.
+    # Done here (not in the CLI command) so unit tests that mock run_server never
+    # mutate os.environ. setdefault → explicit env still wins. MODE / profile are
+    # already resolved into `config` above via their inline defaults.
+    from headroom.agent_savings import seed_proxy_env_defaults
+
+    seed_proxy_env_defaults()
+
     config = config or ProxyConfig()
     code_aware_status = _get_code_aware_banner_status(config)
 
     # Format connection pool info
     pool_info = f"max={config.max_connections}, keepalive={config.max_keepalive_connections}"
-    http2_status = "ENABLED" if config.http2 else "DISABLED"
+    http2_status = "ENABLED" if (config.http2 and not config.http_proxy) else "DISABLED"
 
     backend_status = format_backend_status(
         backend=config.backend,
@@ -4541,6 +4786,10 @@ if __name__ == "__main__":
         help="Disable HTTP/2 (enabled by default for better throughput)",
     )
     parser.add_argument(
+        "--http-proxy",
+        help=("HTTP proxy URL for upstream provider requests only (env: HEADROOM_HTTP_PROXY)"),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -4792,6 +5041,7 @@ if __name__ == "__main__":
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", args.keepalive_expiry),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
+        http_proxy=_get_env_str("HEADROOM_HTTP_PROXY", args.http_proxy or "") or None,
         read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
@@ -4803,10 +5053,10 @@ if __name__ == "__main__":
         protect_tool_results=frozenset(protect_tool_results)
         if protect_tool_results
         else frozenset(),
-        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
-        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         # Default 0.4 keep-ratio so the Kompress text (prose/code) path compresses
         # meaningfully out of the box; HEADROOM_TARGET_RATIO overrides.
         target_ratio=(
