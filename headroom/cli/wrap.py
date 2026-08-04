@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -2989,6 +2989,40 @@ def _normalize_proxy_api_url(url: object) -> str | None:
     return normalized or None
 
 
+def _proxy_anthropic_upstream_mismatch(
+    running_config: dict[str, object], requested: str | None
+) -> bool:
+    """True when a running proxy's Anthropic upstream differs from what we want.
+
+    ``anthropic_api_url`` defaults to ``None`` on the proxy, so "not reported"
+    means "using the default upstream" — which is why a plain ``wrap claude``
+    reusing a plain proxy still matches and is not needlessly restarted.
+    """
+    running = _normalize_proxy_api_url(running_config.get("anthropic_api_url"))
+    if running is None:
+        return False
+    return running != _normalize_proxy_api_url(requested) if requested else True
+
+
+def _build_copilot_native_launch_env(
+    *,
+    port: int,
+    environ: dict[str, str] | None = None,
+    project: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Launch env for native (non-BYOK) Copilot routing through the proxy."""
+    from headroom.providers.copilot.wrap import build_native_launch_env
+
+    return build_native_launch_env(port=port, environ=environ, project=project)
+
+
+def _native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+    """Whether the installed Copilot CLI honours ``COPILOT_API_URL`` (None=unknown)."""
+    from headroom.providers.copilot.wrap import native_api_url_supported
+
+    return native_api_url_supported(environ=environ)
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -3502,6 +3536,12 @@ def _ensure_proxy(
                         requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
+                    # Compared even when the caller wants the DEFAULT upstream
+                    # (anthropic_api_url is None). `wrap copilot --native` pins
+                    # Anthropic at the Copilot host; reusing that for
+                    # `wrap claude` would send Claude traffic to Copilot.
+                    if _proxy_anthropic_upstream_mismatch(running_config, anthropic_api_url):
+                        missing.append("anthropic-api-url")
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
@@ -3521,6 +3561,7 @@ def _ensure_proxy(
                             learn,
                             code_graph,
                             openai_api_url,
+                            anthropic_api_url,
                             copilot_subscription_seed_requested,
                         )
                     ):
@@ -3566,6 +3607,8 @@ def _ensure_proxy(
                         requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
+                    if _proxy_anthropic_upstream_mismatch(running_config, anthropic_api_url):
+                        missing.append("anthropic-api-url")
 
                     if missing:
                         flags_str = ", ".join(f"--{f}" for f in missing)
@@ -3654,13 +3697,18 @@ def _ensure_proxy(
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
+                # Compared even when the caller wants the DEFAULT upstream
+                # (`*_api_url is None`). After `wrap copilot --native` (both
+                # upstreams pinned at Copilot), a later `wrap claude` must not
+                # silently reuse that proxy.
+                for _label, _key, _requested in (
+                    ("openai-api-url", "openai_api_url", openai_api_url),
+                    ("anthropic-api-url", "anthropic_api_url", anthropic_api_url),
+                ):
+                    if _normalize_proxy_api_url(
+                        running_config.get(_key)
+                    ) != _normalize_proxy_api_url(_requested):
+                        missing.append(_label)
                 if vertex_api_url or clear_vertex_api_url:
                     running_vertex_url = _normalize_proxy_api_url(
                         running_config.get("vertex_api_url")
@@ -3673,11 +3721,25 @@ def _ensure_proxy(
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
+                    # Upstream mismatches cannot be shared safely: that would send
+                    # this session's traffic to a different vendor. Isolate instead
+                    # of reusing or disrupting attached wrappers.
+                    upstream_conflict = [flag for flag in missing if flag.endswith("-api-url")]
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
-                    if other_wrappers:
-                        # Another wrapper is attached to this proxy; restarting it
-                        # to add flags would drop their in-flight requests. Reuse
-                        # the running proxy as-is rather than disrupt them.
+                    if upstream_conflict and other_wrappers:
+                        click.echo(
+                            f"  Proxy on port {port} is pinned to a different upstream "
+                            f"({', '.join(upstream_conflict)}) and {len(other_wrappers)} "
+                            "other wrapper(s) are attached."
+                        )
+                        click.echo(
+                            "  Starting a dedicated proxy for this session rather than "
+                            "sharing it or disrupting them."
+                        )
+                        isolated_copilot_subscription_proxy = True
+                    elif other_wrappers:
+                        # A genuinely missing *feature* is safe to live without;
+                        # restarting would drop other sessions' in-flight requests.
                         click.echo(
                             f"  Proxy on port {port} is missing: {flags_str}, but "
                             f"{len(other_wrappers)} other wrapper(s) are attached."
@@ -3714,7 +3776,7 @@ def _ensure_proxy(
                             )
                             return None, port
 
-            if not needs_restart:
+            if not needs_restart and not isolated_copilot_subscription_proxy:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None, port
@@ -3971,6 +4033,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4007,6 +4070,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            anthropic_api_url=anthropic_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -4901,6 +4965,16 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
     ),
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--native",
+    is_flag=True,
+    help=(
+        "Experimental: route Copilot's own GitHub-authenticated API through Headroom "
+        "instead of using the BYOK provider override. Keeps Copilot's native model "
+        "routing (needed for Enterprise aliases like claude-sonnet-5). Implies "
+        "--subscription; no --model required."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
 def copilot(
@@ -4913,6 +4987,7 @@ def copilot(
     wire_api: str | None,
     subscription: bool,
     memory: bool,
+    native: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
 ) -> None:
@@ -4930,10 +5005,11 @@ def copilot(
         headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
         headroom wrap copilot --provider-type openai --wire-api responses -- --model gpt-5.4
         headroom wrap copilot --subscription -- --model gpt-4.1
+        headroom wrap copilot --native -- --model claude-sonnet-5
 
     \b
-    Copilot hosted API (--subscription and the implicit OAuth path) routes to the
-    generic host https://api.githubcopilot.com, which serves the full model set.
+    Copilot hosted API (--subscription, --native, and the implicit OAuth path) routes
+    to the generic host https://api.githubcopilot.com, which serves the full model set.
     Enterprise / data-residency accounts provisioned on a dedicated host pin it
     explicitly with GITHUB_COPILOT_API_URL (the override flows through to upstream).
     See TESTING-copilot-subscription.md for details.
@@ -4956,6 +5032,27 @@ def copilot(
                 f"Stop it or rerun with --backend {running_backend}."
             )
         effective_backend = running_backend or effective_backend
+
+    # --native replaces BYOK interposition rather than layering on it.
+    if native:
+        subscription = True
+        if provider_type == "anthropic":
+            raise click.ClickException(
+                "--native routes Copilot's own API through Headroom and does not use the "
+                "BYOK provider override; do not combine it with --provider-type anthropic."
+            )
+        if wire_api is not None:
+            raise click.ClickException(
+                "--wire-api pins one BYOK wire API for the whole session, which is exactly "
+                "what --native avoids: the wire is chosen per request from the model. "
+                "Drop --wire-api."
+            )
+        if no_proxy:
+            raise click.ClickException(
+                "--native cannot be combined with --no-proxy: it needs to start a proxy "
+                "whose Anthropic and OpenAI upstreams both point at the Copilot host, and "
+                "an already-running proxy cannot be repointed at runtime."
+            )
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
@@ -4984,6 +5081,9 @@ def copilot(
     copilot_api_token_expires_at: float | None = None
     client_bearer: str | None = None
     subscription_resolution: CopilotSubscriptionTokenResolution | None = None
+    # Only set in --native mode: the native CLI sends Claude traffic on the
+    # Anthropic wire, so the proxy's Anthropic upstream must point at Copilot too.
+    copilot_native_anthropic_url: str | None = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
@@ -5002,71 +5102,115 @@ def copilot(
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
-        selected_model = _copilot_model_from_args(copilot_args, env)
-
-        # ``--model auto`` is a Copilot-internal routing token that the BYOK
-        # API rejects with ``400 The requested model is not supported``.  In
-        # subscription/OAuth mode we route to the real Copilot hosted API, so
-        # Copilot's own native auto-selection works fine — we just need to
-        # strip the ``--model auto`` flag before launch so Copilot doesn't
-        # forward it to the provider endpoint.
-        if _is_auto_model(selected_model):
-            copilot_args = _strip_auto_model_args(copilot_args)
-            selected_model = None
-            click.echo(
-                "  Note: '--model auto' is not forwarded to the Copilot API "
-                "(it would cause a 400). Removed it; Copilot will use its own "
-                "automatic model selection."
+        if native:
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
             )
+            env, env_vars_display = _build_copilot_native_launch_env(
+                port=port,
+                environ=env,
+                project=_project_name_from_cwd(),
+            )
+            # Native CLI drives BOTH wires off one base URL: Claude over
+            # /v1/messages and OpenAI over /responses or /chat/completions.
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env["ANTHROPIC_TARGET_API_URL"] = openai_api_url
+            copilot_native_anthropic_url = openai_api_url
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display.append(f"COPILOT_UPSTREAM={openai_api_url}")
 
-        effective_wire_api = wire_api or (
-            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
-        )
-        env["COPILOT_PROVIDER_TYPE"] = "openai"
-        # Per-project savings: the Copilot CLI cannot send custom headers, so
-        # the project rides as a /p/<name> base-URL prefix the proxy strips.
-        env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-            f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
-        )
-        env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
-        env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
-        env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
-        env.pop("COPILOT_PROVIDER_API_KEY", None)
-        # Hand the exact token we resolved (and, for --subscription, validated
-        # against GitHub) to the proxy explicitly via copilot_proxy_token below.
-        # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
-        # deterministic instead of the proxy re-running unvalidated discovery
-        # (read_cached_oauth_token returns the *first* candidate, which may not
-        # be the one the wrapper approved → environment-dependent 401s). Passing
-        # it as a launch argument — rather than mutating this process's global
-        # os.environ — keeps the token off shared state and out of unrelated
-        # code paths.
-        copilot_proxy_token = client_bearer
-        if subscription_resolution is not None:
-            copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
-            copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
-        env_vars_display = [
-            "COPILOT_PROVIDER_TYPE=openai",
-            f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
-            f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
-            (
-                "COPILOT_AUTH_MODE=github-subscription-experimental"
+            support = _native_api_url_supported(environ=os.environ)
+            if support is False:
+                click.echo(
+                    "  Warning: this Copilot CLI build does not appear to honour "
+                    "COPILOT_API_URL. If that is right, the CLI will bypass Headroom "
+                    "entirely and you will silently get no compression. Check the "
+                    f"dashboard at http://127.0.0.1:{port}/dashboard shows traffic; if "
+                    "it does not, re-run without --native to use BYOK mode."
+                )
+            elif support is None and verbose:
+                click.echo(
+                    "  Note: could not verify COPILOT_API_URL support in the installed CLI "
+                    "(it is undocumented). Proceeding; check the dashboard shows traffic."
+                )
+            click.echo(
+                "  Native mode: Copilot keeps its own model routing, so aliases like "
+                "claude-sonnet-5 work on Enterprise/Business tenants and --model is optional."
+            )
+        else:
+            selected_model = _copilot_model_from_args(copilot_args, env)
+
+            # ``--model auto`` is a Copilot-internal routing token that the BYOK
+            # API rejects with ``400 The requested model is not supported``.  In
+            # subscription/OAuth mode we route to the real Copilot hosted API, so
+            # Copilot's own native auto-selection works fine — we just need to
+            # strip the ``--model auto`` flag before launch so Copilot doesn't
+            # forward it to the provider endpoint.
+            if _is_auto_model(selected_model):
+                copilot_args = _strip_auto_model_args(copilot_args)
+                selected_model = None
+                click.echo(
+                    "  Note: '--model auto' is not forwarded to the Copilot API "
+                    "(it would cause a 400). Removed it; Copilot will use its own "
+                    "automatic model selection."
+                )
+
+            effective_wire_api = wire_api or (
+                _copilot_default_wire_api_for_model(selected_model)
                 if subscription
-                else "COPILOT_AUTH_MODE=github-oauth"
-            ),
-        ]
-        # Non-subscription OAuth keeps upstream's generic-host policy from
-        # #610. Subscription mode can use the endpoint returned by the Copilot
-        # token exchange, which is how Business accounts advertise their API
-        # host without requiring users to configure it manually.
-        openai_api_url = (
-            subscription_resolution.api_url
-            if subscription_resolution is not None
-            else resolve_copilot_api_url(client_bearer)
-        )
-        env["GITHUB_COPILOT_API_URL"] = openai_api_url
-        env["OPENAI_TARGET_API_URL"] = openai_api_url
-        env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+                else "completions"
+            )
+            env["COPILOT_PROVIDER_TYPE"] = "openai"
+            # Per-project savings: the Copilot CLI cannot send custom headers, so
+            # the project rides as a /p/<name> base-URL prefix the proxy strips.
+            env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
+                f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+            )
+            env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
+            env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
+            env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
+            env.pop("COPILOT_PROVIDER_API_KEY", None)
+            # Hand the exact token we resolved (and, for --subscription, validated
+            # against GitHub) to the proxy explicitly via copilot_proxy_token below.
+            # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
+            # deterministic instead of the proxy re-running unvalidated discovery
+            # (read_cached_oauth_token returns the *first* candidate, which may not
+            # be the one the wrapper approved → environment-dependent 401s). Passing
+            # it as a launch argument — rather than mutating this process's global
+            # os.environ — keeps the token off shared state and out of unrelated
+            # code paths.
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display = [
+                "COPILOT_PROVIDER_TYPE=openai",
+                f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
+                f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+                (
+                    "COPILOT_AUTH_MODE=github-subscription-experimental"
+                    if subscription
+                    else "COPILOT_AUTH_MODE=github-oauth"
+                ),
+            ]
+            # Non-subscription OAuth keeps upstream's generic-host policy from
+            # #610. Subscription mode can use the endpoint returned by the Copilot
+            # token exchange, which is how Business accounts advertise their API
+            # host without requiring users to configure it manually.
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -5126,6 +5270,9 @@ def copilot(
         anyllm_provider=anyllm_provider,
         region=region,
         openai_api_url=openai_api_url,
+        # None outside --native, so the BYOK path keeps the proxy's default
+        # Anthropic upstream and stays byte-identical to before.
+        anthropic_api_url=copilot_native_anthropic_url,
         copilot_api_token=copilot_proxy_token,
         copilot_refresh_oauth_token=copilot_refresh_oauth_token,
         copilot_api_token_expires_at=copilot_api_token_expires_at,

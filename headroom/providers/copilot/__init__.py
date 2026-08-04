@@ -8,13 +8,17 @@ from .vscode import (
     vscode_user_dir,
 )
 from .wrap import (
+    COPILOT_BYOK_ENV_VARS,
+    COPILOT_NATIVE_API_URL_ENV,
     build_launch_env,
+    build_native_launch_env,
     copilot_model_from_args,
     default_wire_api_for_model,
     detect_running_proxy_backend,
     is_auto_model,
     model_configured,
     model_prefers_responses_api,
+    native_api_url_supported,
     provider_key_source,
     query_proxy_config,
     resolve_provider_type,
@@ -23,13 +27,17 @@ from .wrap import (
 )
 
 __all__ = [
+    "COPILOT_BYOK_ENV_VARS",
+    "COPILOT_NATIVE_API_URL_ENV",
     "build_launch_env",
+    "build_native_launch_env",
     "copilot_model_from_args",
     "default_wire_api_for_model",
     "detect_running_proxy_backend",
     "is_auto_model",
     "model_prefers_responses_api",
     "model_configured",
+    "native_api_url_supported",
     "provider_key_source",
     "query_proxy_config",
     "resolve_provider_type",
