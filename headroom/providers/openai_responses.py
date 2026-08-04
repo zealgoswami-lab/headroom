@@ -32,9 +32,19 @@ OPENAI_RESPONSES_ROOT_PATHS: tuple[str, ...] = (
     "/v1/codex/responses",
     "/backend-api/responses",
     "/backend-api/codex/responses",
+    # Unprefixed form used by Copilot CLI native mode (`wrap copilot --native`).
+    "/responses",
 )
 
-OPENAI_RESPONSES_WEBSOCKET_PATHS: tuple[str, ...] = OPENAI_RESPONSES_ROOT_PATHS
+#: Deliberately not an alias of the HTTP paths above. The websocket relay is the
+#: Codex ``/responses`` transport; Copilot's native WS frames are a different
+#: shape and unverified against it.
+OPENAI_RESPONSES_WEBSOCKET_PATHS: tuple[str, ...] = (
+    "/v1/responses",
+    "/v1/codex/responses",
+    "/backend-api/responses",
+    "/backend-api/codex/responses",
+)
 
 OPENAI_RESPONSES_SUBPATH_ROUTES: tuple[OpenAIResponsesSubpathRoute, ...] = (
     OpenAIResponsesSubpathRoute("/v1/responses/{sub_path:path}", ("GET", "POST", "DELETE")),

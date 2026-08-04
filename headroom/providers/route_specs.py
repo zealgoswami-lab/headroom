@@ -105,6 +105,10 @@ ANTHROPIC_BATCH_ROUTES: tuple[ProviderHandlerRoute, ...] = (
 
 OPENAI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
     ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
+    # Unprefixed form used by Copilot CLI native mode (`wrap copilot --native`).
+    # Without this, native OpenAI-family traffic falls through to passthrough
+    # and is forwarded without compression.
+    ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
 )
 
 

@@ -151,6 +151,109 @@ def default_wire_api_for_model(model: str | None) -> str:
     return "responses" if model_prefers_responses_api(model) else "completions"
 
 
+#: Copilot CLI env var that redirects its **native** (GitHub-authenticated)
+#: API surface. Undocumented in ``copilot help environment``, but the shipped
+#: CLI resolves every native call through a helper that checks it first.
+#: Redirecting this (instead of BYOK) leaves Copilot's own model routing intact,
+#: which is what makes Enterprise aliases like ``claude-sonnet-5`` work.
+COPILOT_NATIVE_API_URL_ENV = "COPILOT_API_URL"
+
+#: BYOK variables that must be cleared in native mode. Any leftover keeps the
+#: CLI on the single-model BYOK path and makes ``--native`` look like a no-op.
+COPILOT_BYOK_ENV_VARS: tuple[str, ...] = (
+    "COPILOT_PROVIDER_BASE_URL",
+    "COPILOT_PROVIDER_TYPE",
+    "COPILOT_PROVIDER_API_KEY",
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "COPILOT_PROVIDER_WIRE_API",
+    "COPILOT_PROVIDER_TRANSPORT",
+    "COPILOT_PROVIDER_AZURE_API_VERSION",
+    "COPILOT_PROVIDER_MODEL_ID",
+    "COPILOT_PROVIDER_WIRE_MODEL",
+    "COPILOT_PROVIDER_MODEL_LIMITS_ID",
+    "COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
+    "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+    "COPILOT_PROVIDER_HEADERS",
+)
+
+
+def _version_key(path: str) -> tuple[int, ...]:
+    """Sortable version tuple from a bundle directory name (``.../1.0.77``)."""
+    name = os.path.basename(path.rstrip(os.sep))
+    parts: list[int] = []
+    for piece in name.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
+
+
+def native_api_url_supported(
+    *, environ: Mapping[str, str] | None = None, home: str | None = None
+) -> bool | None:
+    """Best-effort check that the installed CLI honours ``COPILOT_API_URL``.
+
+    Returns ``True`` when the newest shipped bundle references the variable,
+    ``False`` when a bundle was found and does not, and ``None`` when no bundle
+    could be located (unknown — caller should proceed with a note).
+    """
+    env = environ if environ is not None else os.environ
+    resolved_home = home if home is not None else os.path.expanduser("~")
+    local = env.get("LOCALAPPDATA") or env.get("HOME") or resolved_home
+    roots = [
+        os.path.join(local, "copilot", "pkg"),
+        os.path.join(resolved_home, ".local", "share", "copilot", "pkg"),
+    ]
+
+    bundles: list[tuple[tuple[int, ...], str]] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if "app.js" in filenames:
+                bundles.append((_version_key(dirpath), os.path.join(dirpath, "app.js")))
+    if not bundles:
+        return None
+
+    bundles.sort()
+    read_any = False
+    for _key, path in reversed(bundles):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                read_any = True
+                carry = ""
+                overlap = len(COPILOT_NATIVE_API_URL_ENV) - 1
+                while chunk := fh.read(1 << 20):
+                    if COPILOT_NATIVE_API_URL_ENV in carry + chunk:
+                        return True
+                    carry = chunk[-overlap:] if overlap else ""
+        except OSError:
+            continue
+        return False
+    return False if read_any else None
+
+
+def build_native_launch_env(
+    *,
+    port: int,
+    environ: Mapping[str, str] | None = None,
+    project: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Build the launch environment for native (non-BYOK) Copilot routing.
+
+    Sets :data:`COPILOT_NATIVE_API_URL_ENV` to the local proxy and clears every
+    BYOK variable so the CLI keeps its own GitHub auth and model routing.
+    """
+    env = dict(environ if environ is not None else os.environ)
+    base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
+    env[COPILOT_NATIVE_API_URL_ENV] = base_url
+    for var in COPILOT_BYOK_ENV_VARS:
+        env.pop(var, None)
+    return env, [
+        f"{COPILOT_NATIVE_API_URL_ENV}={base_url}",
+        "COPILOT_AUTH_MODE=github-native (Copilot's own model routing)",
+    ]
+
+
 def provider_key_source(provider_type: str) -> str:
     """Return the preferred provider key variable for the selected provider type."""
     return "ANTHROPIC_API_KEY" if provider_type == "anthropic" else "OPENAI_API_KEY"
